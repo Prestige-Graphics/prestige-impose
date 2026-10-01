@@ -18,9 +18,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 import pymupdf as fitz
 
 from . import __version__, updater
-from .engine import (PT, SHEET_MARGIN_IN, SHEETS, Settings, delete_preset, describe,
-                     finish_rect, has_bleed, load_presets, most_that_fit, plan, render,
-                     render_preview, save_preset)
+from .engine import (PT, SHEET_MARGIN_IN, SHEETS, Settings, best_fit, delete_preset,
+                     describe, finish_rect, has_bleed, load_presets, most_that_fit, plan,
+                     presets_for_size, pull_in_gutters, render, render_preview, save_preset)
 from .paths import CAN_EDIT_PRESETS, ICON_ICO, IS_MAC, IS_WINDOWS
 
 CUSTOM = "Custom"
@@ -29,6 +29,14 @@ GANGS = {"Repeat": "repeat", "Unique": "unique"}
 FINISHES = {"Based on Crop Box": "crop", "Based on Trim Box": "trim"}
 DUPLEX = {"Off": False, "On": True}
 SCALING = {"Do not scale": "none", "Scale to fit": "fit", "Custom": "custom"}
+ROTATIONS = {"Upright": 0, "Turned 90\u00b0": 90}
+CROP_MARKS = {"None": "none", "Outside only": "outside", "Outside + between pieces": "between"}
+
+try:  # drag and drop (optional: the app works without it)
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _BaseTk = TkinterDnD.Tk
+except Exception:  # pragma: no cover - missing library or tkdnd failed to load
+    DND_FILES, _BaseTk = None, tk.Tk
 
 APP_ID = "PrestigeGraphics.Impose"   # must match the installer and the dev shortcut
 UI_FONT = "Segoe UI" if IS_WINDOWS else "Helvetica Neue" if IS_MAC else "TkDefaultFont"
@@ -44,9 +52,15 @@ BG = "#c8c8c8"       # preview backdrop, like Fiery's grey
 PANEL_W = 430
 
 
-class App(tk.Tk):
+class App(_BaseTk):
     def __init__(self, path=None):
-        super().__init__()
+        try:
+            super().__init__()
+        except Exception:  # tkdnd couldn't load: carry on without drag and drop
+            tk.Tk.__init__(self)
+            self.dnd_ok = False
+        else:
+            self.dnd_ok = DND_FILES is not None and _BaseTk is not tk.Tk
         self.title(f"Prestige Impose {__version__}")
         if IS_WINDOWS and ICON_ICO.is_file():
             self.iconbitmap(default=str(ICON_ICO))
@@ -68,6 +82,13 @@ class App(tk.Tk):
         self._build()
         self.bind("<Configure>", lambda e: self._schedule(150) if e.widget is self else None)
         self._bind_zoom_keys()
+        self._bind_shortcuts()
+        if self.dnd_ok:
+            try:
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind("<<Drop>>", self._on_drop)
+            except Exception:
+                self.dnd_ok = False
         if IS_MAC:  # Finder "Open With" and drag-onto-dock arrive as Apple events
             self.createcommand("::tk::mac::OpenDocument",
                                lambda *paths: paths and self.open_pdf(paths[0]))
@@ -176,6 +197,9 @@ class App(tk.Tk):
             "gutter_y": tk.StringVar(value="0"),
             "scaling": tk.StringVar(value="Do not scale"),
             "scale_pct": tk.StringVar(value="100"),
+            "rotate": tk.StringVar(value="Upright"),
+            "head_to_head": tk.BooleanVar(value=False),
+            "crop_marks": tk.StringVar(value="None"),
         }
 
         ttk.Label(p, text="Preset", style="Head.TLabel").pack(anchor="w")
@@ -192,6 +216,17 @@ class App(tk.Tk):
             ttk.Button(pr, text="Delete", width=7, command=self.delete_preset).pack(
                 side="left", padx=(4, 0))
         self._load_presets()
+        # "Suggested: <preset> [Use]" when the opened file matches a preset's file size.
+        self.suggest_row = ttk.Frame(p)
+        self.suggest_label = ttk.Label(self.suggest_row, text="", style="Small.TLabel",
+                                       foreground="#0a5")
+        self.suggest_label.pack(side="left")
+        self.suggest_btn = ttk.Button(self.suggest_row, text="Use", width=5,
+                                      command=self.use_suggestion)
+        self.suggest_btn.pack(side="left", padx=(6, 0))
+        self.suggest_anchor = ttk.Frame(p)
+        self.suggest_anchor.pack(fill="x")
+        self._suggested = None
 
         ttk.Separator(p).pack(fill="x", pady=8)
         ttk.Label(p, text="Settings", style="Head.TLabel").pack(anchor="w", pady=(0, 6))
@@ -209,10 +244,18 @@ class App(tk.Tk):
         self.custom_anchor.pack(fill="x")
 
         self._row(p, "Duplex:", self._combo(v["duplex"], DUPLEX))
+        self._row(p, "Crop marks:", self._combo(v["crop_marks"], CROP_MARKS))
 
         ttk.Separator(p).pack(fill="x", pady=8)
         ttk.Label(p, text="Layout", style="Head.TLabel").pack(anchor="w")
         self._row(p, "Orientation:", self._combo(v["orientation"], ["Portrait", "Landscape"]))
+        pc = ttk.Frame(p)
+        pc.pack(fill="x", pady=3)
+        ttk.Label(pc, text="Pieces:", width=15).pack(side="left")
+        ttk.Combobox(pc, textvariable=v["rotate"], values=list(ROTATIONS), state="readonly",
+                     width=11).pack(side="left")
+        ttk.Checkbutton(pc, text="Head-to-head", variable=v["head_to_head"]).pack(
+            side="left", padx=(10, 0))
 
         rc = ttk.Frame(p)
         rc.pack(fill="x", pady=3)
@@ -244,20 +287,22 @@ class App(tk.Tk):
             row=0, column=4, padx=(6, 0))
         ttk.Button(g, text="Reset", width=9, command=self.reset_gutters).grid(
             row=1, column=4, padx=(6, 0))
+        self.pull_btn = ttk.Button(g, text="Pull in to cut lines", command=self.pull_in)
+        self.pull_btn.grid(row=2, column=1, columnspan=4, sticky="w", pady=(4, 0))
 
-        ttk.Separator(p).pack(fill="x", pady=8)
-        ttk.Label(p, text="Scale", style="Head.TLabel").pack(anchor="w")
-        self._row(p, "Scaling:", self._combo(v["scaling"], SCALING))
+        ttk.Separator(p).pack(fill="x", pady=6)
         sc = ttk.Frame(p)
         sc.pack(fill="x", pady=3)
-        ttk.Label(sc, text="Scale Factor:", width=15).pack(side="left")
+        ttk.Label(sc, text="Scaling:", width=15).pack(side="left")
+        ttk.Combobox(sc, textvariable=v["scaling"], values=list(SCALING), state="readonly",
+                     width=13).pack(side="left")
         self.pct_box = ttk.Spinbox(sc, from_=1, to=400, increment=1,
-                                   textvariable=v["scale_pct"], width=6)
-        self.pct_box.pack(side="left")
+                                   textvariable=v["scale_pct"], width=5)
+        self.pct_box.pack(side="left", padx=(8, 0))
         ttk.Label(sc, text=" %").pack(side="left")
 
         ttk.Separator(p).pack(fill="x", pady=8)
-        self.notes = tk.Text(p, height=14, wrap="word", relief="flat", bg=self.cget("bg"),
+        self.notes = tk.Text(p, height=5, wrap="word", relief="flat", bg=self.cget("bg"),
                              font=(UI_FONT, 9), cursor="arrow")
         self.notes.pack(fill="both", expand=True)
         self.notes.tag_configure("err", foreground="#b00020")
@@ -296,6 +341,9 @@ class App(tk.Tk):
             gutter_x=num("gutter_x", "Column gutter"), gutter_y=num("gutter_y", "Row gutter"),
             scaling=SCALING[v["scaling"].get()],
             scale_pct=num("scale_pct", "Scale factor"),
+            rotate=ROTATIONS[v["rotate"].get()],
+            head_to_head=v["head_to_head"].get(),
+            crop_marks=CROP_MARKS[v["crop_marks"].get()],
         )
 
     def _sync_widgets(self):
@@ -318,6 +366,8 @@ class App(tk.Tk):
         s = self.presets.get(self.preset_var.get())
         if s is not None:
             self._apply_settings(s)
+            if hasattr(self, "suggest_row"):
+                self.suggest_row.pack_forget()
 
     def reset_settings(self):
         """Every new file starts from the defaults, with no preset selected."""
@@ -343,6 +393,10 @@ class App(tk.Tk):
         self._set_gutter("gutter_y", s.gutter_y)
         v["scaling"].set(pick(SCALING, s.scaling))
         v["scale_pct"].set(f"{s.scale_pct:g}")
+        v["rotate"].set(pick(ROTATIONS, s.rotate if s.rotate in ROTATIONS.values() else 0))
+        v["head_to_head"].set(bool(s.head_to_head))
+        v["crop_marks"].set(pick(CROP_MARKS, s.crop_marks if s.crop_marks in CROP_MARKS.values()
+                                 else "none"))
 
     def save_preset(self):
         try:
@@ -359,7 +413,7 @@ class App(tk.Tk):
         if name in self.presets and not messagebox.askyesno(
                 "Replace preset?", f"A preset called '{name}' already exists. Replace it?"):
             return
-        save_preset(name, s)
+        save_preset(name, s, match_size=self._file_size())
         self._load_presets(select=name)
 
     def delete_preset(self):
@@ -369,6 +423,69 @@ class App(tk.Tk):
         if messagebox.askyesno("Delete preset?", f"Delete the preset '{name}'?"):
             delete_preset(name)
             self._load_presets()
+
+    def _file_size(self):
+        """(w, h) inches of the open file's first page, or None."""
+        if not self.src:
+            return None
+        r = self.src[0].rect
+        return (r.width / PT, r.height / PT)
+
+    def _update_suggestion(self):
+        size = self._file_size()
+        names = presets_for_size(*size) if size else []
+        names = [n for n in names if n in self.presets]
+        self._suggested = names[0] if names else None
+        if self._suggested and self.preset_var.get() != self._suggested:
+            self.suggest_label.configure(text=f"Suggested for this file: {self._suggested}")
+            self.suggest_row.pack(in_=self.suggest_anchor, fill="x", pady=(4, 0))
+        else:
+            self.suggest_row.pack_forget()
+
+    def use_suggestion(self):
+        if self._suggested:
+            self.preset_var.set(self._suggested)
+            self.apply_preset()
+            self.suggest_row.pack_forget()
+
+    def pull_in(self):
+        """Set both gutters so the pieces' cut lines just meet."""
+        if not self.src:
+            return
+        try:
+            s = self.settings()
+        except ValueError as e:
+            messagebox.showerror("Check the settings", str(e))
+            return
+        g = pull_in_gutters(self.src, s)
+        if g is None:
+            messagebox.showinfo(
+                "No cut lines found",
+                "This file has no cut line inside the page to pull in to: no trim box, "
+                "and no crop marks of its own. Set the gutters by hand.")
+            return
+        self._set_gutter("gutter_x", g[0])
+        self._set_gutter("gutter_y", g[1])
+        self._schedule()
+
+    def _bind_shortcuts(self):
+        mods = ("Control", "Command") if IS_MAC else ("Control",)
+        for mod in mods:
+            self.bind_all(f"<{mod}-o>", lambda e: (self.choose_pdf(), "break")[1])
+            self.bind_all(f"<{mod}-O>", lambda e: (self.choose_pdf(), "break")[1])
+            self.bind_all(f"<{mod}-s>", lambda e: (self.save(), "break")[1])
+            self.bind_all(f"<{mod}-S>", lambda e: (self.save(), "break")[1])
+        self.bind_all("<Prior>", lambda e: self._step(-1))   # Page Up
+        self.bind_all("<Next>", lambda e: self._step(1))     # Page Down
+
+    def _on_drop(self, event):
+        paths = [Path(p) for p in self.tk.splitlist(event.data)]
+        pdfs = [p for p in paths if p.suffix.lower() == ".pdf"]
+        if pdfs:
+            self.open_pdf(pdfs[0])
+        elif paths:
+            messagebox.showinfo("Not a PDF", "Drop a PDF file to impose it.")
+        return getattr(event, "action", "copy")
 
     def apply_all_gutters(self):
         try:
@@ -445,8 +562,9 @@ class App(tk.Tk):
         note = f'{path.name}  |  {doc.page_count} page(s), {fin.width / PT:.3f}" x {fin.height / PT:.3f}"'
         if has_bleed(doc[0]):
             trim = finish_rect(doc[0], "trim")
-            note += f'  |  trim box {trim.width / PT:.3f}" x {trim.height / PT:.3f}" (bleed built in)'
+            note += f'  |  cuts to {trim.width / PT:.3f}" x {trim.height / PT:.3f}" (bleed built in)'
         self.file_label.configure(text=note)
+        self._update_suggestion()
         self._refresh()
 
     def save(self):
@@ -556,6 +674,10 @@ class App(tk.Tk):
     # ------------------------------------------------------------ actions
 
     def fit_most(self):
+        """
+        Most pieces on the sheet, the way the shop does it: pull in to the cut
+        lines (or keep a tighter gutter already set), and try the pieces turned.
+        """
         if not self.src:
             return
         try:
@@ -563,14 +685,17 @@ class App(tk.Tk):
         except ValueError as e:
             messagebox.showerror("Check the settings", str(e))
             return
-        fin = finish_rect(self.src[0], s.finish)
-        k = s.scale_pct / 100 if s.scaling == "custom" else 1.0
-        r, c = most_that_fit(s, fin.width, fin.height, k)
-        if r and c:
-            self.vars["rows"].set(str(r))
-            self.vars["cols"].set(str(c))
-        else:
+        best = best_fit(self.src, s)
+        if not best:
             messagebox.showinfo("Doesn't fit", "Not even one piece fits on this sheet.")
+            return
+        r, c, rot, gx, gy = best
+        self.vars["rotate"].set(next(k for k, v in ROTATIONS.items() if v == rot))
+        self._set_gutter("gutter_x", gx)
+        self._set_gutter("gutter_y", gy)
+        self.vars["rows"].set(str(r))
+        self.vars["cols"].set(str(c))
+        self._schedule()
 
     def _step(self, d):
         if self.plan:
@@ -619,16 +744,20 @@ class App(tk.Tk):
         self.plan = p = plan(self.src, s)
         self.sheet_index = min(self.sheet_index, max(0, p.sheet_count - 1))
 
-        # Hint: how many fit, both orientations.
+        # Hint: how many fit, pieces upright and turned, pulled in to the cut lines.
         fin = finish_rect(self.src[0], s.finish)
         k = s.scale_pct / 100 if s.scaling == "custom" else 1.0
         hints = []
-        for o in ("portrait", "landscape"):
-            s2 = self.settings()
-            s2.orientation = o
+        for rot, label in ((0, "upright"), (90, "turned")):
+            s2 = Settings(**{**s.__dict__, "rotate": rot})
+            pull = pull_in_gutters(self.src, s2)
+            if pull:
+                s2.gutter_x, s2.gutter_y = min(s2.gutter_x, pull[0]), min(s2.gutter_y, pull[1])
             r, c = most_that_fit(s2, fin.width, fin.height, k)
-            hints.append(f"{o}: {r} x {c} = {r * c}")
-        self.fit_hint.configure(text="Most that fit  -  " + ",  ".join(hints))
+            hints.append(f"{label} {r} x {c} = {r * c}")
+        pulled = " (pulled in to cut lines)" if pull_in_gutters(self.src, s) else ""
+        self.fit_hint.configure(text=f"Most that fit{pulled}: " + ",  ".join(hints))
+        self.pull_btn.configure(state="normal" if pull_in_gutters(self.src, s) else "disabled")
 
         lines = [("", describe(p, self.src.page_count))]
         lines += [("err", "ERROR: " + e) for e in p.errors]

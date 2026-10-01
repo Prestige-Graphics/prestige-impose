@@ -5,7 +5,9 @@ and presets as the window.
     python -m prestige_impose.cli "<file.pdf>" --preset "Illustrator Business Cards 12x18"
     python -m prestige_impose.cli "<file.pdf>" --preset "..." --rows 8       # preset, one change
     python -m prestige_impose.cli "<file.pdf>" --duplex on --rows 7 --cols 3 --gutter -0.6
-    python -m prestige_impose.cli "<file.pdf>" --fit-most --out-dir .tmp/out
+    python -m prestige_impose.cli "<file.pdf>" --fit-most --out-dir .tmp/out   # pulls in, tries turning
+    python -m prestige_impose.cli "<file.pdf>" --pull-in --rows 7 --cols 3     # gutters to the cut lines
+    python -m prestige_impose.cli "<file.pdf>" --rotate 90 --head-to-head --marks between
     python -m prestige_impose.cli --list-presets
 
 Anything given on the command line overrides the preset. The output goes to
@@ -19,8 +21,8 @@ from pathlib import Path
 
 import pymupdf as fitz
 
-from .engine import (PT, SHEETS, Settings, describe, finish_rect, load_presets,
-                     most_that_fit, plan, render)
+from .engine import (PT, SHEETS, Settings, best_fit, describe, load_presets, plan,
+                     pull_in_gutters, render)
 
 
 def parse_sheet(text):
@@ -49,13 +51,18 @@ def main(argv=None):
     ap.add_argument("--duplex", choices=["off", "on"])
     ap.add_argument("--rows", type=int)
     ap.add_argument("--cols", type=int)
-    ap.add_argument("--fit-most", action="store_true", help="use the most rows x columns that fit")
+    ap.add_argument("--fit-most", action="store_true",
+                    help="most pieces that fit: pulls in to the cut lines and tries turning")
+    ap.add_argument("--pull-in", action="store_true",
+                    help="set both gutters so the cut lines just meet")
+    ap.add_argument("--rotate", type=int, choices=[0, 90], help="turn every piece 90 degrees")
+    ap.add_argument("--head-to-head", action="store_true", help="turn every other row upside down")
     ap.add_argument("--gutter", type=float, help="inches, both directions (negative = overlap)")
     ap.add_argument("--gutter-x", type=float, help="inches between columns")
     ap.add_argument("--gutter-y", type=float, help="inches between rows")
     ap.add_argument("--scale", help="none, fit, or a percentage like 95")
-    ap.add_argument("--marks", action="store_true",
-                    help="add guillotine marks outside the layout (off by default)")
+    ap.add_argument("--marks", nargs="?", const="outside", choices=["none", "outside", "between"],
+                    help="crop marks: outside the layout, or also between pieces (off by default)")
     ap.add_argument("--out-dir", default=".", help="folder for the imposed PDF")
     a = ap.parse_args(argv)
 
@@ -81,7 +88,7 @@ def main(argv=None):
         s = replace(presets[a.preset])
     else:
         s = Settings()
-    for key in ("layout", "gang", "finish", "orientation", "rows", "cols"):
+    for key in ("layout", "gang", "finish", "orientation", "rows", "cols", "rotate"):
         if getattr(a, key) is not None:
             setattr(s, key, getattr(a, key))
     if a.sheet:
@@ -100,15 +107,22 @@ def main(argv=None):
         s.scaling = "none"
     elif a.scale:
         s.scaling, s.scale_pct = "custom", float(a.scale.rstrip("%"))
-    s.marks = a.marks
+    if a.head_to_head:
+        s.head_to_head = True
+    if a.marks:
+        s.crop_marks = a.marks
 
     src = fitz.open(stream=src_path.read_bytes(), filetype="pdf")
+    if a.pull_in:
+        g = pull_in_gutters(src, s)
+        if g is None:
+            raise SystemExit("No cut line inside the page to pull in to (no trim box or crop marks).")
+        s.gutter_x, s.gutter_y = g
     if a.fit_most:
-        fin = finish_rect(src[0], s.finish)
-        k = s.scale_pct / 100 if s.scaling == "custom" else 1.0
-        s.rows, s.cols = most_that_fit(s, fin.width, fin.height, k)
-        if not s.rows or not s.cols:
+        best = best_fit(src, s)
+        if not best:
             raise SystemExit("Not even one piece fits on this sheet.")
+        s.rows, s.cols, s.rotate, s.gutter_x, s.gutter_y = best
 
     p = plan(src, s)
     print(describe(p, len(src)))

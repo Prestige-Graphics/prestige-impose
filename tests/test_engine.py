@@ -9,7 +9,7 @@ import pymupdf as fitz
 import pytest
 
 from prestige_impose import engine
-from prestige_impose.engine import PT, Settings, plan, render, render_preview
+from prestige_impose.engine import PT, Settings, describe, plan, render, render_preview
 
 
 def make_pdf(n_pages=2, w_in=3.5, h_in=2.0, bleed_in=0.0, image=False):
@@ -174,3 +174,137 @@ def test_preview_big_page_zoomed_in_draws_only_visible(monkeypatch):
     whole = render_preview(src, p, 0, z, {}, [view])[0]
     diff = sum(abs(a - b) for a, b in zip(part.samples, whole.samples)) / len(part.samples)
     assert diff < 2  # same picture (edge anti-aliasing aside)
+
+
+# ---------------------------------------------------------------- 1.2 features
+
+def page_pixels(page, zoom):
+    return page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+
+
+@pytest.mark.parametrize("rotate,h2h", [(0, False), (90, False), (0, True), (90, True)])
+def test_preview_matches_saved_pdf_turned(rotate, h2h):
+    """The on-screen preview and the saved PDF agree, for every turn and both sides."""
+    src = make_pdf(2, bleed_in=0.125, image=True)
+    p = plan(src, Settings(duplex=True, rows=4, cols=3, finish="trim", rotate=rotate,
+                           head_to_head=h2h))
+    assert not p.errors
+    z = 0.5
+    saved = render(src, p)
+    for prev, page in zip(render_preview(src, p, 0, z, {}), saved):
+        real = page_pixels(page, z)
+        assert (prev.width, prev.height) == (real.width, real.height)
+        diff = sum(abs(a - b) for a, b in zip(prev.samples, real.samples)) / len(real.samples)
+        assert diff < 3, f"preview differs from saved PDF by {diff:.1f}"
+
+
+def test_rotate_90_turns_the_slots():
+    src = make_pdf(1)
+    p = plan(src, Settings(rows=1, cols=1, rotate=90))
+    pl = p.sides[0][0][0]
+    assert round(pl.visible.width / PT, 2) == 2.0 and round(pl.visible.height / PT, 2) == 3.5
+    assert pl.angle == 90
+
+
+def test_head_to_head_turns_every_other_row_and_backs_follow():
+    src = make_pdf(2)
+    p = plan(src, Settings(duplex=True, rows=4, cols=2, head_to_head=True))
+    front, back = p.sides[0]
+    rows = sorted({round(pl.visible.y0) for pl in front})
+    angle_by_row = {round(pl.visible.y0): pl.angle for pl in front}
+    assert [angle_by_row[r] for r in rows] == [0, 180, 0, 180]
+    assert sorted(pl.angle for pl in back) == sorted(pl.angle for pl in front)
+
+
+def test_turned_backs_turn_the_other_way():
+    src = make_pdf(2)
+    front, back = plan(src, Settings(duplex=True, rows=2, cols=2, rotate=90)).sides[0]
+    assert {pl.angle for pl in front} == {90} and {pl.angle for pl in back} == {270}
+
+
+def make_marked_pdf(slug_in=0.2917, w_in=3.5, h_in=2.0, art_lines=True):
+    """Illustrator-style: no TrimBox, crop marks running in from the page edge."""
+    doc = fitz.open()
+    b = slug_in * PT
+    page = doc.new_page(width=w_in * PT + 2 * b, height=h_in * PT + 2 * b)
+    t = fitz.Rect(b, b, b + w_in * PT, b + h_in * PT)
+    r = page.rect
+    mark = b - 0.083 * PT
+    for x in (t.x0, t.x1):
+        page.draw_line((x, 0), (x, mark))
+        page.draw_line((x, r.y1), (x, r.y1 - mark))
+    for y in (t.y0, t.y1):
+        page.draw_line((0, y), (mark, y))
+        page.draw_line((r.x1, y), (r.x1 - mark, y))
+    if art_lines:  # short lines in the design that must not be taken for marks
+        page.draw_line((t.x0 + 30, t.y0 + 20), (t.x0 + 30, t.y0 + 40))
+        page.draw_line((t.x0 + 50, r.y1 - 1), (t.x0 + 50, r.y1 - 20))  # only at the bottom
+    return fitz.open(stream=doc.tobytes(), filetype="pdf")
+
+
+def test_finds_cut_line_from_crop_marks():
+    src = make_marked_pdf()
+    t = engine.trim_rect(src[0])
+    assert [round(v / PT, 3) for v in t] == [0.292, 0.292, 3.792, 2.292]
+
+
+def test_no_marks_means_no_cut_line():
+    src = make_pdf(1)
+    assert not engine.has_bleed(src[0])
+    assert engine.pull_in_gutters(src, Settings()) is None
+
+
+def test_pull_in_to_cut_lines():
+    src = make_marked_pdf()
+    assert engine.pull_in_gutters(src, Settings()) == pytest.approx((-0.5833, -0.5833), abs=2e-4)
+    src2 = make_pdf(1, bleed_in=0.125)           # TrimBox file, 1/8" bleed
+    assert engine.pull_in_gutters(src2, Settings()) == (-0.25, -0.25)
+    assert engine.pull_in_gutters(src2, Settings(finish="trim")) == (0.0, 0.0)
+
+
+def test_best_fit_pulls_in_and_tries_turning():
+    src = make_marked_pdf()
+    rows, cols, rot, gx, gy = engine.best_fit(src, Settings())
+    assert rows * cols == 24 and (gx, gy) == pytest.approx((-0.5833, -0.5833), abs=2e-4)
+    # A tighter gutter the operator already chose is kept.
+    assert engine.best_fit(src, Settings(gutter_x=-0.63, gutter_y=-0.63))[3:] == (-0.63, -0.63)
+
+
+def test_finished_size_shows_over_pulling():
+    src = make_marked_pdf()
+    exact = plan(src, Settings(rows=7, cols=3, gutter_x=-0.5833, gutter_y=-0.5833))
+    assert [round(v / PT, 2) for v in exact.finished] == [3.5, 2.0]
+    tight = plan(src, Settings(rows=7, cols=3, gutter_x=-0.63, gutter_y=-0.63))
+    assert [round(v / PT, 3) for v in tight.finished] == [3.453, 1.953]
+    assert "Pieces finish at 3.453" in describe(tight, 1)
+
+
+def test_crop_marks_between_warns_on_inked_corners():
+    inked = make_pdf(1, bleed_in=0.125)          # dark all the way to the edge
+    p = plan(inked, Settings(rows=2, cols=2, finish="trim", crop_marks="between"))
+    assert any("artwork at its corners" in w for w in p.warnings)
+    clean = make_marked_pdf()                    # white corners
+    p2 = plan(clean, Settings(rows=2, cols=2, gutter_x=-0.5833, gutter_y=-0.5833,
+                              crop_marks="between"))
+    assert not any("corners" in w for w in p2.warnings)
+    lines = engine.between_lines(p2.sides[0][0])
+    assert len(lines) >= 4
+
+
+def test_crop_marks_drawn_only_when_asked():
+    src = make_pdf(1)
+    for mode, expect in (("none", 0), ("outside", 1), ("between", 1)):
+        out = render(src, plan(src, Settings(rows=2, cols=2, gutter_x=0.25, gutter_y=0.25,
+                                             crop_marks=mode)))
+        n = sum(1 for d in out[0].get_drawings() for it in d["items"] if it[0] == "l")
+        assert (n > 0) == bool(expect), mode
+
+
+def test_presets_remember_file_size(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "PRESETS_FILE", tmp_path / "p.json")
+    engine.save_preset("Cards", Settings(rows=7, cols=3), match_size=(4.0833, 2.5833))
+    assert engine.presets_for_size(4.0833, 2.5833) == ["Cards"]
+    assert engine.presets_for_size(2.5833, 4.0833) == ["Cards"]   # either way round
+    assert engine.presets_for_size(3.5, 2.0) == []
+    engine.save_preset("Cards", Settings(rows=8, cols=3))          # re-save keeps the size
+    assert engine.presets_for_size(4.0833, 2.5833) == ["Cards"]

@@ -10,6 +10,8 @@ import re
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_data_files
+
 ROOT = Path(SPECPATH).parent
 VERSION = re.search(r'__version__ = "([^"]+)"',
                     (ROOT / "prestige_impose" / "__init__.py").read_text()).group(1)
@@ -22,8 +24,8 @@ a = Analysis(
     datas=[
         (str(ROOT / "presets" / "shared_presets.json"), "presets"),
         (str(ROOT / "assets" / "icon.ico"), "assets"),
-    ],
-    hiddenimports=["certifi"],
+    ] + collect_data_files("tkinterdnd2"),   # the tkdnd drag-and-drop library
+    hiddenimports=["certifi", "tkinterdnd2"],
     excludes=["pytest", "PIL"],
 )
 pyz = PYZ(a.pure)

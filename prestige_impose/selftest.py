@@ -24,6 +24,15 @@ def _checks():
     tkinter.Tcl().eval("info patchlevel")  # Tcl runtime bundled and loads
     yield f"tkinter {tkinter.TkVersion}"
 
+    import os
+    import platform
+    import tkinterdnd2
+    tkdnd = os.path.join(os.path.dirname(tkinterdnd2.__file__), "tkdnd")
+    want = {"win32": "win-x64", "darwin": "osx-arm64" if platform.machine() == "arm64" else "osx-x64"}
+    sub = want.get(sys.platform)
+    assert sub is None or os.path.isdir(os.path.join(tkdnd, sub)), f"drag-and-drop files missing ({sub})"
+    yield f"drag and drop ({sub or 'n/a'})"
+
     presets = load_presets()
     assert presets, "no shared presets bundled"
     yield f"{len(presets)} preset(s)"

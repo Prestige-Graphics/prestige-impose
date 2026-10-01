@@ -22,7 +22,18 @@ Layout modes
                     that, top-left first as you look at the back.
 
 Duplex backs are mirrored left/right to sit behind their fronts, which matches
-the Fiery's default (Top-Top) for a portrait sheet.
+the Fiery's default (Top-Top) for a portrait sheet. A turned piece's back is
+turned the other way, so it still lines up after the sheet flips.
+
+Turning pieces
+  rotate 90         every piece is turned a quarter turn (to fit more on a sheet).
+  head-to-head      every other row is turned upside down (tent cards, folded
+                    pieces printed head to head).
+
+Cut lines
+  The cut line of a piece is the file's TrimBox if it has one. If it doesn't,
+  the file's own crop marks are looked for (short lines running in from the
+  page edge, as Illustrator and InDesign export them).
 
 Gutters, including negative ones
   The gutter is the space between neighbouring slots, like Fiery's. A negative
@@ -55,6 +66,7 @@ MARK_LENGTH_IN = 0.25
 MARK_MIN_GAP_IN = 0.0625  # a mark never starts closer than this to printed art
 MARK_WIDTH_PT = 0.25     # hairline
 MARK_CMYK = (0.0, 0.0, 0.0, 1.0)  # 100% K, not rich black
+MARK_BETWEEN_ARM_IN = 0.09  # arm length of the small crosses drawn between pieces
 
 # Fiery's default layout margin is 2.54 mm (0.1"), shown in its Settings panel
 # as "Margin: Default". Like Fiery, anything that falls in this strip around the
@@ -86,7 +98,13 @@ class Settings:
     gutter_y: float = 0.0           # inches between rows
     scaling: str = "none"           # none | fit | custom
     scale_pct: float = 100.0        # used when scaling == custom
-    marks: bool = False             # our guillotine marks; files usually carry their own
+    rotate: int = 0                 # 0 | 90: turn every piece a quarter turn
+    head_to_head: bool = False      # turn every other row upside down
+    crop_marks: str = "none"        # none | outside | between (files usually bring their own)
+
+    @property
+    def marks(self):
+        return self.crop_marks != "none"
 
     def sheet_size(self):
         a, b = sorted((self.sheet_w, self.sheet_h))
@@ -94,8 +112,8 @@ class Settings:
 
     @classmethod
     def from_dict(cls, d):
-        # "marks" isn't a preset setting any more: files bring their own.
-        known = {f.name for f in fields(cls)} - {"marks"}
+        # Old presets had a "marks" yes/no; crop marks are now "crop_marks".
+        known = {f.name for f in fields(cls)}
         d = dict(d)
         if isinstance(d.get("duplex"), str):  # older form: "off" / "leftright"
             d["duplex"] = d["duplex"] != "off"
@@ -109,6 +127,7 @@ class Placement:
     visible: fitz.Rect   # where it lands on the sheet (after trimming overlaps)
     clip: fitz.Rect      # the matching part of the source page
     cut: fitz.Rect       # where this piece is cut, on the sheet
+    angle: int = 0       # clockwise turn of the piece on the sheet: 0, 90, 180, 270
 
 
 @dataclass
@@ -122,6 +141,7 @@ class Plan:
     grid: fitz.Rect                 # bounding box of all slots
     slots: list                     # fitz.Rect per slot, reading order, front side
     sides: list                     # [(front, back or None)], each a list of Placement
+    finished: tuple = (0.0, 0.0)    # (w, h) points each piece ends up after cutting
     errors: list = field(default_factory=list)    # stop: output would be wrong
     warnings: list = field(default_factory=list)  # look before printing
 
@@ -136,34 +156,63 @@ class Plan:
 
 # ------------------------------------------------------------------- presets
 
-def load_presets():
-    """{name: Settings}. Missing or unreadable file = no presets."""
+def _read_presets_file():
     try:
-        raw = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
+        return json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return {name: Settings.from_dict(d) for name, d in raw.items()}
 
 
-def _write_presets(presets):
+def load_presets():
+    """{name: Settings}. Missing or unreadable file = no presets."""
+    return {name: Settings.from_dict(d) for name, d in _read_presets_file().items()}
+
+
+def load_preset_sizes():
+    """{name: (w, h) inches} of the file each preset was saved with, where known."""
+    out = {}
+    for name, d in _read_presets_file().items():
+        size = d.get("match_size")
+        if isinstance(size, list) and len(size) == 2:
+            out[name] = (float(size[0]), float(size[1]))
+    return out
+
+
+def presets_for_size(w_in, h_in, tol=0.01):
+    """Preset names saved with a file of this page size (either way round)."""
+    hits = []
+    for name, (pw, ph) in load_preset_sizes().items():
+        if ((abs(pw - w_in) <= tol and abs(ph - h_in) <= tol)
+                or (abs(pw - h_in) <= tol and abs(ph - w_in) <= tol)):
+            hits.append(name)
+    return hits
+
+
+def _write_presets(raw):
     PRESETS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = {name: asdict(s) for name, s in sorted(presets.items(), key=lambda kv: kv[0].lower())}
+    data = dict(sorted(raw.items(), key=lambda kv: kv[0].lower()))
     fd, tmp = tempfile.mkstemp(dir=PRESETS_FILE.parent, suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, PRESETS_FILE)  # never leaves a half-written file
 
 
-def save_preset(name, settings):
-    presets = load_presets()
-    presets[name] = settings
-    _write_presets(presets)
+def save_preset(name, settings, match_size=None):
+    """match_size: (w, h) inches of the file it was made with, to suggest it later."""
+    raw = _read_presets_file()
+    entry = asdict(settings)
+    if match_size:
+        entry["match_size"] = [round(match_size[0], 4), round(match_size[1], 4)]
+    elif isinstance(raw.get(name, {}).get("match_size"), list):
+        entry["match_size"] = raw[name]["match_size"]
+    raw[name] = entry
+    _write_presets(raw)
 
 
 def delete_preset(name):
-    presets = load_presets()
-    if presets.pop(name, None) is not None:
-        _write_presets(presets)
+    raw = _read_presets_file()
+    if raw.pop(name, None) is not None:
+        _write_presets(raw)
 
 
 # ------------------------------------------------------------------ geometry
@@ -181,7 +230,7 @@ def finish_rect(page, finish):
     return trim_rect(page)
 
 
-def trim_rect(page):
+def _declared_trim(page):
     trim = fitz.Rect(page.trimbox)
     crop = fitz.Rect(page.cropbox)
     trim = trim - (crop.x0, crop.y0, crop.x0, crop.y0)
@@ -190,16 +239,125 @@ def trim_rect(page):
     return trim & page.rect
 
 
-def has_bleed(page):
-    """True if the file declares a TrimBox smaller than the page: bleed built in."""
-    t, r = trim_rect(page), page.rect
+def _inset(t, r):
     return (t.width < r.width - 0.5) or (t.height < r.height - 0.5)
 
 
+def find_crop_marks(page):
+    """
+    The cut line from the file's own crop marks, or None. Marks are short
+    straight lines running in from the page edge (0.4" or less), lined up with
+    the cut. A cut line only counts if marks for it sit on both opposite
+    edges, so lines in the artwork aren't mistaken for marks.
+    """
+    r = page.rect
+    edge, longest = 2.0, 0.4 * PT
+    top, bottom, left, right = [], [], [], []
+    for d in page.get_drawings():
+        for it in d.get("items", ()):
+            if it[0] != "l":
+                continue
+            a, b = it[1], it[2]
+            if abs(a - b) > longest or abs(a - b) < 2:
+                continue
+            if abs(a.x - b.x) < 0.3:                    # vertical
+                if min(a.y, b.y) <= r.y0 + edge:
+                    top.append(a.x)
+                elif max(a.y, b.y) >= r.y1 - edge:
+                    bottom.append(a.x)
+            elif abs(a.y - b.y) < 0.3:                  # horizontal
+                if min(a.x, b.x) <= r.x0 + edge:
+                    left.append(a.y)
+                elif max(a.x, b.x) >= r.x1 - edge:
+                    right.append(a.y)
+
+    def both(one, other):
+        return sorted(v for v in _merge(one, 0.6) if any(abs(v - w) < 0.6 for w in other))
+
+    xs, ys = both(top, bottom), both(left, right)
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+    t = fitz.Rect(xs[0], ys[0], xs[-1], ys[-1])
+    if t.width < r.width * 0.3 or t.height < r.height * 0.3 or not _inset(t, r):
+        return None
+    return t
+
+
+def trim_rect(page):
+    """Where this page is cut: its TrimBox, else its own crop marks, else the page edge."""
+    doc = page.parent
+    cache = getattr(doc, "_prestige_trim", None)
+    if cache is None:
+        cache = {}
+        try:
+            doc._prestige_trim = cache
+        except AttributeError:
+            pass
+    key = page.number
+    if key not in cache:
+        t = _declared_trim(page)
+        if not _inset(t, page.rect):
+            t = find_crop_marks(page) or fitz.Rect(page.rect)
+        cache[key] = t
+    return fitz.Rect(cache[key])
+
+
+def has_bleed(page):
+    """True if the page has a cut line inside it (TrimBox or its own crop marks)."""
+    return _inset(trim_rect(page), page.rect)
+
+
 def bleed_sides(page):
-    """(left, top, right, bottom) points between the trim box and the page edge."""
+    """(left, top, right, bottom) points between the cut line and the page edge."""
     t, r = trim_rect(page), page.rect
     return (t.x0 - r.x0, t.y0 - r.y0, r.x1 - t.x1, r.y1 - t.y1)
+
+
+def pull_in_gutters(src, s):
+    """
+    The gutters (inches) that pull pieces in until their cut lines just meet,
+    or None if the file has no cut line inside the page to go by.
+    """
+    page = src[0]
+    if s.finish == "trim":
+        return (0.0, 0.0) if has_bleed(page) else None
+    if not has_bleed(page):
+        return None
+    k = s.scale_pct / 100 if s.scaling == "custom" else 1.0
+    bl, bt, br, bb = bleed_sides(page)
+    gx, gy = -(bl + br) * k / PT, -(bt + bb) * k / PT
+    if s.rotate % 180:
+        gx, gy = gy, gx
+    return round(gx, 4), round(gy, 4)
+
+
+def edges_clear(page, finish="crop"):
+    """
+    True if the corners just inside the cut line are blank, so crop marks
+    drawn there (between pieces) won't print on the design.
+    """
+    cache = getattr(page.parent, "_prestige_clear", None)
+    if cache is None:
+        cache = {}
+        try:
+            page.parent._prestige_clear = cache
+        except AttributeError:
+            pass
+    if page.number in cache:
+        return cache[page.number]
+    t = trim_rect(page)
+    a = MARK_BETWEEN_ARM_IN * PT + 1
+    clear = True
+    for cx, cy in ((t.x0, t.y0), (t.x1, t.y0), (t.x0, t.y1), (t.x1, t.y1)):
+        box = fitz.Rect(cx - a, cy - a, cx + a, cy + a) & t
+        if box.is_empty:
+            continue
+        pix = page.get_pixmap(clip=box, dpi=96, colorspace=fitz.csGRAY, alpha=False)
+        if pix.samples and min(pix.samples) < 235:
+            clear = False
+            break
+    cache[page.number] = clear
+    return clear
 
 
 def mark_space():
@@ -214,27 +372,58 @@ def usable_area(s):
 
 
 def most_that_fit(s, finish_w, finish_h, scale=1.0):
-    """(rows, cols) that fit on the sheet at this scale and gutter."""
+    """(rows, cols) that fit on the sheet at this scale, gutter and piece rotation."""
     aw, ah = usable_area(s)
     cw, ch = finish_w * scale, finish_h * scale
+    if s.rotate % 180:
+        cw, ch = ch, cw
     gx, gy = s.gutter_x * PT, s.gutter_y * PT
     cols = max(0, floor((aw + gx + 0.01) / (cw + gx))) if cw + gx > 0 else 0
     rows = max(0, floor((ah + gy + 0.01) / (ch + gy))) if ch + gy > 0 else 0
     return rows, cols
 
 
-def _place(src, pno, slot, grid, s, scale, safe):
-    """Work out one page in one slot: what shows, from where, and where it's cut."""
+def best_fit(src, s):
+    """
+    Fit most, done the way the shop does it: pull the pieces in to their cut
+    lines (unless the gutters are already tighter), then try the pieces both
+    upright and turned 90 degrees and keep whichever fits more.
+    Returns (rows, cols, rotate, gutter_x, gutter_y) or None if nothing fits.
+    """
+    fin = finish_rect(src[0], s.finish)
+    k = s.scale_pct / 100 if s.scaling == "custom" else 1.0
+    best = None
+    for rot in ((s.rotate, 90 - s.rotate) if s.rotate in (0, 90) else (s.rotate,)):
+        t = replace(s, rotate=rot)
+        pull = pull_in_gutters(src, t)
+        gx, gy = t.gutter_x, t.gutter_y
+        if pull:
+            gx, gy = min(gx, pull[0]), min(gy, pull[1])
+        t = replace(t, gutter_x=gx, gutter_y=gy)
+        r, c = most_that_fit(t, fin.width, fin.height, k)
+        if r and c and (best is None or r * c > best[0] * best[1]):
+            best = (r, c, rot, gx, gy)
+    return best
+
+
+def _place(src, pno, slot, grid, s, scale, safe, angle=0):
+    """
+    Work out one page in one slot: what shows, from where, and where it's cut.
+    `angle` turns the piece clockwise on the sheet (0, 90, 180, 270).
+    """
     page = src[pno]
     fin = finish_rect(page, s.finish)
     k = scale
-    w, h = fin.width * k, fin.height * k
-    cx, cy = (slot.x0 + slot.x1) / 2, (slot.y0 + slot.y1) / 2
-    tf = fitz.Rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)  # fin, on the sheet
+    sc = fitz.Point((slot.x0 + slot.x1) / 2, (slot.y0 + slot.y1) / 2)
+    fc = fitz.Point((fin.x0 + fin.x1) / 2, (fin.y0 + fin.y1) / 2)
+    # Source page -> sheet: centre the piece on the slot, scale, turn.
+    m = (fitz.Matrix(1, 0, 0, 1, -fc.x, -fc.y) * fitz.Matrix(k, k) * fitz.Matrix(angle)
+         * fitz.Matrix(1, 0, 0, 1, sc.x, sc.y))
 
     def to_sheet(r):
-        return fitz.Rect(tf.x0 + (r.x0 - fin.x0) * k, tf.y0 + (r.y0 - fin.y0) * k,
-                         tf.x0 + (r.x1 - fin.x0) * k, tf.y0 + (r.y1 - fin.y0) * k)
+        q = fitz.Rect(r) * m
+        q.normalize()
+        return q
 
     # How far past its slot a piece may show on each side: all the way on the
     # outside of the layout, half the gutter where it meets a neighbour. A
@@ -248,11 +437,11 @@ def _place(src, pno, slot, grid, s, scale, safe):
     visible = to_sheet(page.rect) & bound & safe  # blank in the margin, like Fiery
     if visible.is_empty:
         return None
-    clip = fitz.Rect(fin.x0 + (visible.x0 - tf.x0) / k, fin.y0 + (visible.y0 - tf.y0) / k,
-                     fin.x0 + (visible.x1 - tf.x0) / k, fin.y0 + (visible.y1 - tf.y0) / k)
-    # The cut: the file's own trim box if it has one, else the edge of what shows.
+    clip = fitz.Rect(visible) * ~m
+    clip.normalize()
+    # The cut: the file's own cut line if it has one, else the edge of what shows.
     cut = to_sheet(trim_rect(page)) if has_bleed(page) else fitz.Rect(visible)
-    return Placement(pno, visible, clip, cut)
+    return Placement(pno, visible, clip, cut, angle)
 
 
 def _merge(values, tol=0.5):
@@ -292,6 +481,31 @@ def mark_lines(placements):
     for y in ys:
         lines.append((fitz.Point(left, y), fitz.Point(left - length, y)))
         lines.append((fitz.Point(right, y), fitz.Point(right + length, y)))
+    return lines
+
+
+def between_lines(placements):
+    """
+    Small crosses where inside cut lines meet, drawn over the pieces. Only
+    sensible when the design's corners are blank (see edges_clear).
+    """
+    if not placements:
+        return []
+    xs = _merge(v for p in placements for v in (p.cut.x0, p.cut.x1))
+    ys = _merge(v for p in placements for v in (p.cut.y0, p.cut.y1))
+    a = MARK_BETWEEN_ARM_IN * PT
+    lines = []
+    for x in xs[1:-1]:
+        for y in ys[1:-1]:
+            lines.append((fitz.Point(x - a, y), fitz.Point(x + a, y)))
+            lines.append((fitz.Point(x, y - a), fitz.Point(x, y + a)))
+    # Where an inside cut meets the outside edge of the layout, a short tick inward.
+    for x in xs[1:-1]:
+        lines.append((fitz.Point(x, ys[0]), fitz.Point(x, ys[0] + a)))
+        lines.append((fitz.Point(x, ys[-1]), fitz.Point(x, ys[-1] - a)))
+    for y in ys[1:-1]:
+        lines.append((fitz.Point(xs[0], y), fitz.Point(xs[0] + a, y)))
+        lines.append((fitz.Point(xs[-1], y), fitz.Point(xs[-1] - a, y)))
     return lines
 
 
@@ -343,6 +557,8 @@ def plan(src, s):
                         "won't be the file's size.")
 
     cw, ch = fw * scale, fh * scale
+    if s.rotate % 180:
+        cw, ch = ch, cw
     if (s.cols > 1 and cw + gx <= 0) or (s.rows > 1 and ch + gy <= 0):
         errors.append("The negative gutter is bigger than the piece itself.")
         gx, gy = max(gx, -cw + 1), max(gy, -ch + 1)
@@ -413,18 +629,46 @@ def plan(src, s):
     s_eff = replace(s, gutter_x=gx / PT, gutter_y=gy / PT)
     mgrid = mirror(grid)
 
+    row_pitch = ch + gy
+
+    def angle_for(slot, back):
+        a = s.rotate % 360
+        if s.head_to_head:
+            row = round((slot.y0 - y0) / row_pitch) if row_pitch else 0
+            if row % 2:
+                a = (a + 180) % 360
+        # Flipping the sheet left/right reverses a quarter turn.
+        return (-a) % 360 if back else a
+
     def resolve(entries, back=False):
         if entries is None:
             return None
         g = mgrid if back else grid
         out = []
         for slot, pno in entries:
-            pl = _place(src, pno, slot, g, s_eff, scale, safe)
+            pl = _place(src, pno, slot, g, s_eff, scale, safe, angle_for(slot, back))
             if pl:
                 out.append(pl)
         return out
 
     resolved = [(resolve(f), resolve(b, back=s.layout != "normal")) for f, b in sides]
+
+    # The size each piece really ends up after cutting: its cut line, unless
+    # neighbours were pulled in past it (then the spacing decides).
+    finished = (0.0, 0.0)
+    if resolved and resolved[0][0]:
+        c0 = resolved[0][0][0].cut
+        fw_cut = min(c0.width, cw + gx) if s.cols > 1 else c0.width
+        fh_cut = min(c0.height, ch + gy) if s.rows > 1 else c0.height
+        finished = (fw_cut, fh_cut)
+
+    # Marks drawn over the design only make sense where its corners are blank.
+    if s.crop_marks == "between":
+        inked = [p.number + 1 for p in src if p.number < 20 and not edges_clear(p)]
+        if inked:
+            shown = ", ".join(map(str, inked[:6])) + ("..." if len(inked) > 6 else "")
+            warnings.append(f"Page {shown} has artwork at its corners, so the crop marks between "
+                            "pieces will print on the design there.")
 
     # Bigger than the sheet is allowed (sometimes on purpose); just say so.
     if not sheet_rect.contains(grid):
@@ -435,7 +679,7 @@ def plan(src, s):
 
     return Plan(settings=s, sheet=(sheet_w, sheet_h), finish=(fw, fh), scale=scale,
                 cell=(cw, ch), grid=grid, slots=slots, sides=resolved,
-                errors=errors, warnings=warnings)
+                finished=finished, errors=errors, warnings=warnings)
 
 
 # -------------------------------------------------------------------- render
@@ -454,11 +698,15 @@ def render(src, plan_, sheets=None):
                 continue
             page = out.new_page(width=sw, height=sh)
             for pl in entries:
+                # show_pdf_page turns counter-clockwise; our angles are clockwise.
                 page.show_pdf_page(pl.visible, src, pl.pno, clip=pl.clip,
-                                   keep_proportion=False)
+                                   rotate=(-pl.angle) % 360, keep_proportion=False)
             if plan_.settings.marks and entries:
                 shape = page.new_shape()
-                for a, b in mark_lines(entries):
+                lines = mark_lines(entries)
+                if plan_.settings.crop_marks == "between":
+                    lines += between_lines(entries)
+                for a, b in lines:
                     shape.draw_line(a, b)
                 # closePath=False: a trailing 'h' would double-stroke the last mark.
                 shape.finish(color=MARK_CMYK, width=MARK_WIDTH_PT, closePath=False)
@@ -480,9 +728,17 @@ def describe(plan_, n_pages):
     sw, sh = (v / PT for v in plan_.sheet)
     mode = "Normal" if s.layout == "normal" else f"Gangup, {s.gang}"
     dup = "duplex" if s.duplex else "single-sided"
+    turned = []
+    if s.rotate % 360:
+        turned.append("pieces turned 90\u00b0")
+    if s.head_to_head:
+        turned.append("head-to-head")
+    turned = f" ({', '.join(turned)})" if turned else ""
+    pw, ph = (v / PT for v in plan_.finished)
+    finished = f' Pieces finish at {pw:.3f}" x {ph:.3f}".' if pw and ph else ""
     return (f'{n_pages} page(s), {fw:.3f}" x {fh:.3f}" each. {mode}, {s.rows} x {s.cols} = '
-            f'{plan_.per_sheet} up on {sw:g}" x {sh:g}" {s.orientation}, {dup}. '
-            f"{plan_.sheet_count} sheet(s) to print.")
+            f'{plan_.per_sheet} up on {sw:g}" x {sh:g}" {s.orientation}{turned}, {dup}. '
+            f"{plan_.sheet_count} sheet(s) to print.{finished}")
 
 
 # ------------------------------------------------------------------- preview
@@ -522,21 +778,34 @@ def render_preview(src, plan_, sheet_index, zoom, cache, views=None):
                 continue
             page = src[pl.pno]
             pr = page.rect
-            # Where the whole page would sit on the sheet, in sheet pixels.
-            off_x = round((pl.visible.x0 - (pl.clip.x0 - pr.x0) * k) * zoom)
-            off_y = round((pl.visible.y0 - (pl.clip.y0 - pr.y0) * k) * zoom)
+            # Page -> sheet for this placement (same mapping _place used):
+            # the visible area came from `clip`, turned by `angle`.
+            m = (fitz.Matrix(1, 0, 0, 1, -pl.clip.x0, -pl.clip.y0) * fitz.Matrix(k, k)
+                 * fitz.Matrix(pl.angle))
+            turned_clip = fitz.Rect(pl.clip) * m
+            m = m * fitz.Matrix(1, 0, 0, 1, pl.visible.x0 - turned_clip.x0,
+                                pl.visible.y0 - turned_clip.y0)
+            on_sheet = fitz.Rect(pr) * m                   # whole page on the sheet
+            on_sheet.normalize()
+            mz = fitz.Matrix(zk, zk).prerotate(pl.angle)   # page -> pixmap space
+            bbox = (fitz.Rect(pr) * mz).irect
+            off_x, off_y = round(on_sheet.x0 * zoom), round(on_sheet.y0 * zoom)
             if pr.width * zk * pr.height * zk <= PREVIEW_CACHE_MAX_PX:
-                key = (pl.pno, round(zk, 5))
+                key = (pl.pno, round(zk, 5), pl.angle)
                 pix = cache.get(key)
                 if pix is None:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(zk, zk), alpha=False)
+                    pix = page.get_pixmap(matrix=mz, alpha=False)
                     cache[key] = pix
+                # A cached picture is reused across slots: place it from
+                # scratch each time (its own top-left is the page's top-left).
                 pix.set_origin(off_x, off_y)
             else:
-                part = fitz.Rect((target.x0 - off_x) / zk - 1, (target.y0 - off_y) / zk - 1,
-                                 (target.x1 - off_x) / zk + 1, (target.y1 - off_y) / zk + 1)
-                pix = page.get_pixmap(matrix=fitz.Matrix(zk, zk), clip=part & pr, alpha=False)
-                pix.set_origin(off_x + pix.x, off_y + pix.y)
+                part = fitz.Rect(target.x0 / zoom, target.y0 / zoom,
+                                 target.x1 / zoom, target.y1 / zoom) * ~m
+                part.normalize()
+                part = (part + (-1, -1, 1, 1)) & pr
+                pix = page.get_pixmap(matrix=mz, clip=part, alpha=False)
+                pix.set_origin(off_x + pix.x - bbox.x0, off_y + pix.y - bbox.y0)
             sheet.copy(pix, target)
         out.append(sheet)
     return out
