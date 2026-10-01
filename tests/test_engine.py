@@ -144,3 +144,33 @@ def test_shipped_presets_load():
 def test_version_compare(tag, newer):
     from prestige_impose import updater
     assert (updater._parse(tag) > updater._parse("1.0.0")) is newer
+
+
+def test_preview_view_matches_full_render():
+    """Drawing only the on-screen part gives the same pixels as drawing it all."""
+    src = make_pdf(2, bleed_in=0.29167, image=True)
+    p = plan(src, Settings(duplex=True, rows=7, cols=3, gutter_x=-0.6, gutter_y=-0.6))
+    z = 1.5
+    full = render_preview(src, p, 0, z, {})
+    view = fitz.IRect(300, 400, 700, 900)
+    part = render_preview(src, p, 0, z, {}, [view, view])
+    for f, q in zip(full, part):
+        assert (q.x, q.y, q.width, q.height) == (300, 400, 400, 500)
+        crop = fitz.Pixmap(fitz.csRGB, view, False)
+        crop.copy(f, view)
+        assert crop.samples == q.samples
+
+
+def test_preview_big_page_zoomed_in_draws_only_visible(monkeypatch):
+    """A flyer at high zoom isn't cached whole; the visible part still matches."""
+    src = make_pdf(1, w_in=8.5, h_in=11, image=True)
+    p = plan(src, Settings(rows=1, cols=1))
+    z = 6.0  # ~600% on a typical screen
+    cache = {}
+    view = fitz.IRect(1000, 1500, 1800, 2100)
+    part = render_preview(src, p, 0, z, cache, [view])[0]
+    assert not cache  # too big to cache whole
+    monkeypatch.setattr(engine, "PREVIEW_CACHE_MAX_PX", 10 ** 12)
+    whole = render_preview(src, p, 0, z, {}, [view])[0]
+    diff = sum(abs(a - b) for a, b in zip(part.samples, whole.samples)) / len(part.samples)
+    assert diff < 2  # same picture (edge anti-aliasing aside)

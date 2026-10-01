@@ -35,6 +35,11 @@ UI_FONT = "Segoe UI" if IS_WINDOWS else "Helvetica Neue" if IS_MAC else "TkDefau
 
 GUTTER_STEP = 0.02   # inches per arrow click
 
+ZOOM_STEP = 1.25     # each zoom in/out click or key press
+ZOOM_MIN_PCT = 10    # % of actual size
+ZOOM_MAX_PCT = 800
+PREVIEW_GAP, PREVIEW_PAD, PREVIEW_LABEL_H = 40, 24, 26
+
 BG = "#c8c8c8"       # preview backdrop, like Fiery's grey
 PANEL_W = 430
 
@@ -56,9 +61,13 @@ class App(tk.Tk):
         self._after = None
         self._images = []        # keep PhotoImages alive
         self._preview_cache = {}  # source pages drawn at preview size
+        self.zoom_factor = 1.0    # 1.0 = fit the window; bigger = zoomed in
+        self._layout = None       # where the sheets sit on the canvas, for zoom/pan
+        self._draw_after = None
 
         self._build()
         self.bind("<Configure>", lambda e: self._schedule(150) if e.widget is self else None)
+        self._bind_zoom_keys()
         if IS_MAC:  # Finder "Open With" and drag-onto-dock arrive as Apple events
             self.createcommand("::tk::mac::OpenDocument",
                                lambda *paths: paths and self.open_pdf(paths[0]))
@@ -102,10 +111,36 @@ class App(tk.Tk):
         # Preview (left)
         left = ttk.Frame(body)
         left.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(left, bg=BG, highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+        view = ttk.Frame(left)
+        view.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(view, bg=BG, highlightthickness=0)
+        xbar = ttk.Scrollbar(view, orient="horizontal", command=self._xview)
+        ybar = ttk.Scrollbar(view, orient="vertical", command=self._yview)
+        self.canvas.configure(xscrollcommand=xbar.set, yscrollcommand=ybar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        view.rowconfigure(0, weight=1)
+        view.columnconfigure(0, weight=1)
+        # Drag to pan; wheel scrolls (Shift = sideways); Ctrl/Cmd + wheel zooms at the pointer.
+        self.canvas.bind("<ButtonPress-1>", lambda e: self.canvas.scan_mark(e.x, e.y))
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<MouseWheel>", lambda e: self._wheel(e, "y"))
+        self.canvas.bind("<Shift-MouseWheel>", lambda e: self._wheel(e, "x"))
+        for mod in ("Control", "Command") if IS_MAC else ("Control",):
+            self.canvas.bind(f"<{mod}-MouseWheel>",
+                             lambda e: self.zoom(ZOOM_STEP if e.delta > 0 else 1 / ZOOM_STEP,
+                                                 at=(e.x, e.y)))
+        self.canvas.bind("<Configure>", lambda e: self._schedule_draw(60))
+
         nav = ttk.Frame(left, padding=4)
         nav.pack(fill="x")
+        ttk.Button(nav, text="Fit", width=5, command=self.zoom_fit).pack(side="right")
+        ttk.Button(nav, text="+", width=3, command=lambda: self.zoom(ZOOM_STEP)).pack(side="right")
+        self.zoom_label = ttk.Label(nav, text="", width=6, anchor="center")
+        self.zoom_label.pack(side="right", padx=2)
+        ttk.Button(nav, text="\u2212", width=3, command=lambda: self.zoom(1 / ZOOM_STEP)).pack(
+            side="right")
         self.prev_btn = ttk.Button(nav, text="< Prev", width=8, command=lambda: self._step(-1))
         self.prev_btn.pack(side="left")
         self.sheet_label = ttk.Label(nav, text="", width=18, anchor="center")
@@ -403,6 +438,7 @@ class App(tk.Tk):
         self.src, self.src_path = doc, path
         self._preview_cache = {}
         self.sheet_index = 0
+        self.zoom_factor = 1.0
         self.reset_settings()
 
         fin = finish_rect(doc[0], "crop")
@@ -563,6 +599,9 @@ class App(tk.Tk):
         cw, ch = max(self.canvas.winfo_width(), 200), max(self.canvas.winfo_height(), 200)
 
         if not self.src:
+            self._layout = None
+            self.zoom_label.configure(text="")
+            self.canvas.configure(scrollregion=(0, 0, cw, ch))
             self.canvas.create_text(cw / 2, ch / 2, text="Open a PDF to start",
                                     font=(UI_FONT, 14), fill="#444")
             self._set_nav(0)
@@ -600,39 +639,155 @@ class App(tk.Tk):
         self.save_btn.configure(state="disabled" if p.errors else "normal")
         self._set_nav(p.sheet_count)
 
-        if not p.sides:
+        self._notes_lines = lines
+        self._draw_preview()
+
+    # ------------------------------------------------------------ zoom / pan
+
+    def _bind_zoom_keys(self):
+        """Ctrl + / Ctrl - zoom toward the mouse (Cmd on a Mac); Ctrl 0 fits."""
+        mods = ("Control", "Command") if IS_MAC else ("Control",)
+        for mod in mods:
+            for key in ("plus", "equal", "KP_Add"):
+                self.bind_all(f"<{mod}-{key}>", lambda e: self._zoom_key(ZOOM_STEP))
+            for key in ("minus", "underscore", "KP_Subtract"):
+                self.bind_all(f"<{mod}-{key}>", lambda e: self._zoom_key(1 / ZOOM_STEP))
+            for key in ("0", "KP_0"):
+                self.bind_all(f"<{mod}-{key}>", lambda e: self.zoom_fit())
+
+    def _zoom_key(self, mult):
+        # Zoom toward the mouse if it's over the preview, else the middle.
+        px, py = self.winfo_pointerxy()
+        x, y = px - self.canvas.winfo_rootx(), py - self.canvas.winfo_rooty()
+        inside = 0 <= x < self.canvas.winfo_width() and 0 <= y < self.canvas.winfo_height()
+        self.zoom(mult, at=(x, y) if inside else None)
+        return "break"
+
+    def _fit_zoom(self, n, sw, sh):
+        cw, ch = max(self.canvas.winfo_width(), 200), max(self.canvas.winfo_height(), 200)
+        g, pad, lab = PREVIEW_GAP, PREVIEW_PAD, PREVIEW_LABEL_H
+        return max(min((cw - 2 * pad - g * (n - 1)) / (n * sw), (ch - 2 * pad - lab) / sh), 0.02)
+
+    def _pct(self, zpx):
+        """Screen pixels per point -> % of actual size."""
+        return zpx * 72 / self.winfo_fpixels("1i") * 100
+
+    def zoom(self, mult, at=None):
+        lay = self._layout
+        if not lay:
             return
+        # Clamp to 10%..800% of actual size.
+        fit = lay["fit"]
+        lo = ZOOM_MIN_PCT / self._pct(fit)
+        hi = ZOOM_MAX_PCT / self._pct(fit)
+        new = min(max(self.zoom_factor * mult, lo), hi)
+        if abs(new - self.zoom_factor) < 1e-9:
+            return
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        mx, my = at if at else (cw / 2, ch / 2)
+        # The sheet point under the pointer, so it stays under the pointer.
+        cx, cy = self.canvas.canvasx(mx), self.canvas.canvasy(my)
+        z = lay["zpx"]
+        step = lay["w_px"] + PREVIEW_GAP
+        i = min(max(int((cx - lay["x0"]) // step), 0), lay["n"] - 1)
+        u = ((cx - (lay["x0"] + i * step)) / z, (cy - lay["y0"]) / z)
+        self.zoom_factor = new
+        self._draw_preview(anchor=(i, u, mx, my))
+
+    def zoom_fit(self):
+        self.zoom_factor = 1.0
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
+        self._draw_preview()
+        return "break"
+
+    def _xview(self, *args):
+        self.canvas.xview(*args)
+        self._schedule_draw()
+
+    def _yview(self, *args):
+        self.canvas.yview(*args)
+        self._schedule_draw()
+
+    def _wheel(self, e, axis):
+        steps = -1 if e.delta > 0 else 1
+        (self.canvas.xview_scroll if axis == "x" else self.canvas.yview_scroll)(steps * 3, "units")
+        self._schedule_draw()
+
+    def _drag(self, e):
+        self.canvas.scan_dragto(e.x, e.y, gain=1)
+        self._schedule_draw(15)
+
+    def _schedule_draw(self, ms=30):
+        if self._draw_after:
+            self.after_cancel(self._draw_after)
+        self._draw_after = self.after(ms, self._draw_preview)
+
+    def _draw_preview(self, anchor=None):
+        """
+        Draw the current sheet at the current zoom. Only the part on screen is
+        rendered, so zooming in costs no more than the fitted view. `anchor`
+        keeps a sheet point under the pointer while zooming.
+        """
+        self._draw_after = None
+        p = self.plan
+        if not self.src or not p or not p.sides:
+            return
+        self.canvas.delete("all")
+        self._images.clear()
+        cw, ch = max(self.canvas.winfo_width(), 200), max(self.canvas.winfo_height(), 200)
         n = sum(1 for side in p.sides[self.sheet_index] if side is not None)
         labels = ["Front", "Back"] if n == 2 else ["Front"]
         sw, sh = p.sheet
-        gap, pad, label_h = 40, 24, 26
-        zoom = min((cw - 2 * pad - gap * (n - 1)) / (n * sw), (ch - 2 * pad - label_h) / sh)
-        zoom = max(zoom, 0.05)
-        if len(self._preview_cache) > 40:  # many window sizes / scales seen
+        g, pad, lab = PREVIEW_GAP, PREVIEW_PAD, PREVIEW_LABEL_H
+        fit = self._fit_zoom(n, sw, sh)
+        zpx = fit * self.zoom_factor
+        w_px, h_px = sw * zpx, sh * zpx
+        content_w = n * w_px + (n - 1) * g + 2 * pad
+        content_h = h_px + lab + 2 * pad
+        region_w, region_h = max(cw, content_w), max(ch, content_h)
+        x0 = (region_w - (n * w_px + (n - 1) * g)) / 2
+        y0 = (region_h - lab - h_px) / 2
+        self.canvas.configure(scrollregion=(0, 0, region_w, region_h))
+        self._layout = {"fit": fit, "zpx": zpx, "w_px": w_px, "x0": x0, "y0": y0, "n": n}
+        self.zoom_label.configure(text=f"{self._pct(zpx):.0f}%")
+
+        if anchor:  # put the anchored sheet point back under the pointer
+            i, (ux, uy), mx, my = anchor
+            ax = x0 + i * (w_px + g) + ux * zpx
+            ay = y0 + uy * zpx
+            self.canvas.xview_moveto(max(0.0, (ax - mx) / region_w))
+            self.canvas.yview_moveto(max(0.0, (ay - my) / region_h))
+
+        vx0, vy0 = self.canvas.canvasx(0), self.canvas.canvasy(0)
+        views = []
+        for i in range(n):
+            ox = x0 + i * (w_px + g)
+            views.append(fitz.IRect(int(vx0 - ox) - 2, int(vy0 - y0) - 2,
+                                    int(vx0 + cw - ox) + 3, int(vy0 + ch - y0) + 3))
+        if len(self._preview_cache) > 40:  # many zoom levels seen
             self._preview_cache.clear()
         try:
-            pixmaps = render_preview(self.src, p, self.sheet_index, zoom, self._preview_cache)
+            pixmaps = render_preview(self.src, p, self.sheet_index, zpx, self._preview_cache, views)
         except Exception as e:  # show it in the panel, keep the window alive
-            self._notes(lines + [("err", f"Preview failed: {e}")])
-            self.save_btn.configure(state="disabled")
+            self._notes(getattr(self, "_notes_lines", []) + [("err", f"Preview failed: {e}")])
             return
-        w_px, h_px = pixmaps[0].width, pixmaps[0].height
-        x = (cw - (n * w_px + (n - 1) * gap)) / 2
-        y = (ch - label_h - h_px) / 2
-        for pix, label in zip(pixmaps, labels):
-            img = tk.PhotoImage(data=pix.tobytes("ppm"))  # uncompressed: fastest into Tk
-            self._images.append(img)
-            self.canvas.create_rectangle(x + 3, y + 3, x + w_px + 3, y + h_px + 3,
+        mg = SHEET_MARGIN_IN * PT * zpx
+        for i, (pix, label) in enumerate(zip(pixmaps, labels)):
+            ox = x0 + i * (w_px + g)
+            self.canvas.create_rectangle(ox + 3, y0 + 3, ox + w_px + 3, y0 + h_px + 3,
                                          fill="#9a9a9a", outline="")
-            self.canvas.create_image(x, y, image=img, anchor="nw")
+            self.canvas.create_rectangle(ox, y0, ox + w_px, y0 + h_px, fill="white", outline="")
+            if pix is not None:
+                img = tk.PhotoImage(data=pix.tobytes("ppm"))  # uncompressed: fastest into Tk
+                self._images.append(img)
+                self.canvas.create_image(ox + pix.x, y0 + pix.y, image=img, anchor="nw")
             # The 0.1" margin Fiery leaves blank, as a faint dashed line.
-            mg = SHEET_MARGIN_IN * PT * zoom
-            self.canvas.create_rectangle(x + mg, y + mg, x + w_px - mg, y + h_px - mg,
+            self.canvas.create_rectangle(ox + mg, y0 + mg, ox + w_px - mg, y0 + h_px - mg,
                                          outline="#9ab", dash=(3, 3))
-            self.canvas.create_text(x + w_px / 2, y + h_px + 14,
+            self.canvas.create_text(ox + w_px / 2, y0 + h_px + 14,
                                     text=f"Sheet {self.sheet_index + 1} - {label}",
                                     font=(UI_FONT, 10))
-            x += w_px + gap
 
     def _set_nav(self, count):
         if count:

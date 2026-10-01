@@ -3,6 +3,13 @@
 Each version's notes are what staff see in the app's "Update available"
 window. Write them for the person at the press, in plain words.
 
+## 1.1.0 (2026-10-01)
+
+- Zoom the preview: the - and + buttons under the preview, or Ctrl + and Ctrl - (Command on a Mac) to zoom in toward wherever your mouse is. Ctrl 0 or the Fit button goes back to the whole sheet.
+- Ctrl + mouse wheel zooms at the pointer too.
+- When zoomed in, drag the preview to move around, or use the mouse wheel and scrollbars (hold Shift to scroll sideways).
+- The zoom level shows as a percentage of actual size, like Fiery.
+
 ## 1.0.0 (2026-10-01)
 
 - First release for Prestige staff, on Windows and Mac.

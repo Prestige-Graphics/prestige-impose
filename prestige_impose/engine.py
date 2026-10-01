@@ -487,35 +487,56 @@ def describe(plan_, n_pages):
 
 # ------------------------------------------------------------------- preview
 
-def render_preview(src, plan_, sheet_index, zoom, cache):
+PREVIEW_CACHE_MAX_PX = 8_000_000   # a page bigger than this at preview zoom isn't cached
+
+def render_preview(src, plan_, sheet_index, zoom, cache, views=None):
     """
     Fast on-screen picture of one sheet (front, and back if duplex), as
-    Pixmaps. Each source page is drawn once at preview size and kept in
-    `cache` (a dict the caller owns and clears when the file changes); every
-    slot is then a pixel copy of the visible part. Same layout as render(),
-    but the saved PDF always comes from render(), never from this.
+    Pixmaps. Same layout as render(), but the saved PDF always comes from
+    render(), never from this.
+
+    `zoom` is screen pixels per point. `views` (one IRect per side, in that
+    side's pixels) limits drawing to what's on screen, so a zoomed-in preview
+    costs no more than a fitted one; a side with nothing visible comes back
+    as None. Each source page is drawn once at this zoom and kept in `cache`
+    (a dict the caller owns and clears), unless that would be huge (a flyer
+    zoomed right in): then only its visible part is drawn, each time.
     """
     sw, sh = plan_.sheet
     k = plan_.scale
+    zk = zoom * k
+    full = fitz.IRect(0, 0, round(sw * zoom), round(sh * zoom))
     out = []
-    for entries in plan_.sides[sheet_index]:
-        if entries is None:
+    sides = [e for e in plan_.sides[sheet_index] if e is not None]
+    for i, entries in enumerate(sides):
+        view = full if views is None else fitz.IRect(views[i]) & full
+        if view.is_empty:
+            out.append(None)
             continue
-        sheet = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, round(sw * zoom), round(sh * zoom)), False)
+        sheet = fitz.Pixmap(fitz.csRGB, view, False)   # origin = view's top-left
         sheet.clear_with(255)
         for pl in entries:
+            target = fitz.IRect(round(pl.visible.x0 * zoom), round(pl.visible.y0 * zoom),
+                                round(pl.visible.x1 * zoom), round(pl.visible.y1 * zoom)) & view
+            if target.is_empty:
+                continue
             page = src[pl.pno]
-            key = (pl.pno, round(zoom * k, 5))
-            pix = cache.get(key)
-            if pix is None:
-                pix = page.get_pixmap(matrix=fitz.Matrix(zoom * k, zoom * k), alpha=False)
-                cache[key] = pix
-            # Where the whole page would sit on the sheet; show only `visible`.
             pr = page.rect
-            full_x0 = pl.visible.x0 - (pl.clip.x0 - pr.x0) * k
-            full_y0 = pl.visible.y0 - (pl.clip.y0 - pr.y0) * k
-            pix.set_origin(round(full_x0 * zoom), round(full_y0 * zoom))
-            sheet.copy(pix, fitz.IRect(round(pl.visible.x0 * zoom), round(pl.visible.y0 * zoom),
-                                       round(pl.visible.x1 * zoom), round(pl.visible.y1 * zoom)))
+            # Where the whole page would sit on the sheet, in sheet pixels.
+            off_x = round((pl.visible.x0 - (pl.clip.x0 - pr.x0) * k) * zoom)
+            off_y = round((pl.visible.y0 - (pl.clip.y0 - pr.y0) * k) * zoom)
+            if pr.width * zk * pr.height * zk <= PREVIEW_CACHE_MAX_PX:
+                key = (pl.pno, round(zk, 5))
+                pix = cache.get(key)
+                if pix is None:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(zk, zk), alpha=False)
+                    cache[key] = pix
+                pix.set_origin(off_x, off_y)
+            else:
+                part = fitz.Rect((target.x0 - off_x) / zk - 1, (target.y0 - off_y) / zk - 1,
+                                 (target.x1 - off_x) / zk + 1, (target.y1 - off_y) / zk + 1)
+                pix = page.get_pixmap(matrix=fitz.Matrix(zk, zk), clip=part & pr, alpha=False)
+                pix.set_origin(off_x + pix.x, off_y + pix.y)
+            sheet.copy(pix, target)
         out.append(sheet)
     return out
