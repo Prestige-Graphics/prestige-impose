@@ -2,3 +2,4 @@
 pyinstaller>=6.10
 pytest
 pillow
+pywin32; sys_platform == "win32"
