@@ -1,0 +1,122 @@
+# Build Prestige Impose for Windows and Mac, test each build, and publish a
+# release that the app's update check picks up.
+#
+#   Push a tag like v1.2.0  -> test, build, self-test, publish the release.
+#   Run it by hand          -> test and build only (download the files from the
+#                              run's Artifacts to try them before releasing).
+
+name: Build and release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -r requirements.txt pytest
+      - run: pytest -q
+      - name: Release notes exist for this version
+        run: python tools/release_notes.py > /dev/null
+      - name: Tag matches the app's version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(python -c "import prestige_impose as p; print(p.__version__)")
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match __version__ $v"; exit 1
+          fi
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller packaging/prestige_impose.spec --noconfirm
+      - name: Self-test the built app
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\Prestige Impose\Prestige Impose.exe" `
+                 -ArgumentList "--selftest","--selftest-log","selftest.txt" -Wait -PassThru
+          Get-Content selftest.txt
+          if ($p.ExitCode -ne 0) { exit 1 }
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $v = python -c "import prestige_impose as p; print(p.__version__)"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=$v" packaging\windows_installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/PrestigeImpose-Setup-*.exe
+          if-no-files-found: error
+
+  mac:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14          # Apple chip (M1 and later)
+            arch: arm64
+          - runner: macos-15-intel    # Intel Macs
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -r requirements.txt pyinstaller pillow
+      - run: pyinstaller packaging/prestige_impose.spec --noconfirm
+      - name: Self-test the built app
+        run: |
+          "dist/Prestige Impose.app/Contents/MacOS/Prestige Impose" --selftest --selftest-log selftest.txt
+          cat selftest.txt
+          file "dist/Prestige Impose.app/Contents/MacOS/Prestige Impose"
+      - name: Zip the app
+        run: |
+          v=$(python -c "import prestige_impose as p; print(p.__version__)")
+          cd dist
+          ditto -c -k --keepParent "Prestige Impose.app" "PrestigeImpose-$v-mac-${{ matrix.arch }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.arch }}
+          path: dist/PrestigeImpose-*-mac-*.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          python3 tools/release_notes.py "$v" > notes.md
+          gh release create "$GITHUB_REF_NAME" out/* --title "Prestige Impose $v" --notes-file notes.md

@@ -1,0 +1,18 @@
+{
+  "Illustrator Business Cards 12x18": {
+    "layout": "gangup",
+    "gang": "repeat",
+    "finish": "crop",
+    "sheet_w": 12.0,
+    "sheet_h": 18.0,
+    "orientation": "portrait",
+    "duplex": true,
+    "rows": 7,
+    "cols": 3,
+    "gutter_x": -0.63,
+    "gutter_y": -0.63,
+    "scaling": "none",
+    "scale_pct": 100.0,
+    "marks": false
+  }
+}
