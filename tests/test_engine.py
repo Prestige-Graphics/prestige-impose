@@ -254,20 +254,34 @@ def test_no_marks_means_no_cut_line():
     assert engine.pull_in_gutters(src, Settings()) is None
 
 
-def test_pull_in_to_cut_lines():
-    src = make_marked_pdf()
-    assert engine.pull_in_gutters(src, Settings()) == pytest.approx((-0.5833, -0.5833), abs=2e-4)
-    src2 = make_pdf(1, bleed_in=0.125)           # TrimBox file, 1/8" bleed
+def test_pull_in_keeps_crop_marks_showing():
+    # Illustrator card: 0.4583" slug, marks start 0.083" out. Leo's preset is -0.63.
+    ill = make_marked_pdf(slug_in=0.4583)
+    assert engine.own_mark_gaps(ill[0]) == pytest.approx([0.083 * PT] * 4, abs=0.05)
+    assert engine.pull_in_gutters(ill, Settings()) == pytest.approx((-0.63, -0.63), abs=2e-3)
+    # InDesign-style card, 0.2917" slug: less to pull in.
+    ind = make_marked_pdf()
+    assert engine.pull_in_gutters(ind, Settings()) == pytest.approx((-0.2974, -0.2974), abs=2e-3)
+    # No marks of its own (TrimBox and bleed only): the cut lines meet.
+    src2 = make_pdf(1, bleed_in=0.125)
     assert engine.pull_in_gutters(src2, Settings()) == (-0.25, -0.25)
     assert engine.pull_in_gutters(src2, Settings(finish="trim")) == (0.0, 0.0)
 
 
-def test_best_fit_pulls_in_and_tries_turning():
-    src = make_marked_pdf()
-    rows, cols, rot, gx, gy = engine.best_fit(src, Settings())
-    assert rows * cols == 24 and (gx, gy) == pytest.approx((-0.5833, -0.5833), abs=2e-4)
-    # A tighter gutter the operator already chose is kept.
-    assert engine.best_fit(src, Settings(gutter_x=-0.63, gutter_y=-0.63))[3:] == (-0.63, -0.63)
+def test_best_fit_matches_the_shops_7x3():
+    # 12x18 business cards: the shop knows 7 x 3 is what fits with marks showing.
+    for slug in (0.4583, 0.2917):
+        rows, cols, rot, gx, gy = engine.best_fit(make_marked_pdf(slug_in=slug), Settings())
+        assert (rows, cols, rot) == (7, 3, 0), slug
+        p = plan(make_marked_pdf(slug_in=slug),
+                 Settings(rows=rows, cols=cols, gutter_x=gx, gutter_y=gy))
+        assert [round(v / PT, 2) for v in p.finished] == [3.5, 2.0]
+        assert not any("bigger than" in w for w in p.warnings)
+        # Turning on the app's own crop marks doesn't cost a column: they shorten to fit.
+        with_marks = engine.best_fit(make_marked_pdf(slug_in=slug), Settings(crop_marks="outside"))
+        assert with_marks[:3] == (7, 3, 0), slug
+    # A card with no bleed can turn: 5 x 5 turned beats 8 x 3 upright.
+    assert engine.best_fit(make_pdf(1), Settings())[:3] == (5, 5, 90)
 
 
 def test_finished_size_shows_over_pulling():
@@ -308,3 +322,50 @@ def test_presets_remember_file_size(tmp_path, monkeypatch):
     assert engine.presets_for_size(3.5, 2.0) == []
     engine.save_preset("Cards", Settings(rows=8, cols=3))          # re-save keeps the size
     assert engine.presets_for_size(4.0833, 2.5833) == ["Cards"]
+
+
+def test_preset_suggested_for_any_card_that_pulls_in_the_same(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "PRESETS_FILE", tmp_path / "p.json")
+    engine.save_preset("Illustrator", Settings(rows=7, cols=3, gutter_x=-0.63, gutter_y=-0.63),
+                       match_size=(4.4167, 2.9167), match_cut=(3.5, 2.0))
+    assert engine.presets_for_file(make_marked_pdf(slug_in=0.4583)) == ["Illustrator"]
+    # Same marks, a slightly different page (e.g. re-exported): still offered.
+    assert engine.presets_for_file(make_marked_pdf(slug_in=0.46)) == ["Illustrator"]
+    # InDesign-style card, same cut: -0.63 would hide its marks, so not offered.
+    assert engine.presets_for_file(make_marked_pdf(slug_in=0.2917)) == []
+    assert engine.presets_for_file(make_pdf(1)) == []
+
+
+def test_pull_in_preset_fits_each_card(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "PRESETS_FILE", tmp_path / "p.json")
+    s = Settings(rows=7, cols=3, duplex=True, gutter_x=-0.63, gutter_y=-0.63, pull_in=True)
+    engine.save_preset("Cards", s, match_size=(4.4167, 2.9167), match_cut=(3.5, 2.0))
+    narrow = make_marked_pdf(slug_in=0.2917)         # e.g. a 4.083 x 2.583 card
+    assert engine.presets_for_file(narrow) == ["Cards"]
+    got = engine.settings_for_file(narrow, engine.load_presets()["Cards"])
+    assert (got.gutter_x, got.gutter_y) == pytest.approx((-0.2974, -0.2974), abs=2e-3)
+    p = plan(narrow, got)
+    assert [round(v / PT, 2) for v in p.finished] == [3.5, 2.0] and p.per_sheet == 21
+    wide = make_marked_pdf(slug_in=0.4583)
+    got = engine.settings_for_file(wide, engine.load_presets()["Cards"])
+    assert (got.gutter_x, got.gutter_y) == pytest.approx((-0.63, -0.63), abs=2e-3)
+
+
+def test_crop_marks_show_in_preview_and_stay_on_the_sheet():
+    # Leo's preset on an Illustrator card fills the sheet nearly edge to edge.
+    src = make_marked_pdf(slug_in=0.4583, art_lines=False)
+    p = plan(src, Settings(rows=7, cols=3, gutter_x=-0.63, gutter_y=-0.63, crop_marks="outside"))
+    lines = engine.sheet_marks(p, p.sides[0][0])
+    assert len(lines) == 2 * 6 + 2 * 14       # 6 vertical cuts, 14 horizontal
+    m = engine.SHEET_MARGIN_IN * PT
+    safe = fitz.Rect(m, m, p.sheet[0] - m, p.sheet[1] - m) + (-0.01, -0.01, 0.01, 0.01)
+    assert all(safe.contains(a) and safe.contains(b) for a, b in lines)
+    # The preview draws them: the pixel under a mark is black.
+    zoom = 1.0
+    pix = render_preview(src, p, 0, zoom, {})[0]
+    a, b = lines[0]
+    x, y = round((a.x + b.x) / 2 * zoom), round((a.y + b.y) / 2 * zoom)
+    assert pix.pixel(x, y) == (0, 0, 0)
+    off = render_preview(src, plan(src, Settings(rows=7, cols=3, gutter_x=-0.63,
+                                                 gutter_y=-0.63)), 0, zoom, {})[0]
+    assert off.pixel(x, y) != (0, 0, 0)

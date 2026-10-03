@@ -3,16 +3,19 @@
 Each version's notes are what staff see in the app's "Update available"
 window. Write them for the person at the press, in plain words.
 
-## 1.2.0 (2026-10-01)
+## 1.2.0 (2026-10-03)
 
+- **Send to Fiery.** The new "Send to Fiery..." button sends the imposed job straight to a press's Held queue in Command WorkStation. Pick the press (Press 1 - C4070 or Press 2 - C4070NEW), the paper, the job name, the quantity, the tray and colour or grayscale. Duplex and the sheet size go with it automatically, and the imposed PDF is saved next to the original as well. Nothing prints until someone releases it from Held.
+- Quantity is the number of finished pieces: 500 cards at 21 up sends 24 sheets (always rounded up). For files where every piece is different, or normal documents, it's the number of sets.
+- Paper weight and type come from Fiery Virtual Printers set up in Command WorkStation. Until those are set up, choose "Set in Command WorkStation" and set the paper in Held.
 - Drag a PDF onto the window to open it.
 - Shortcuts: Ctrl+O to open, Ctrl+S to save, Page Up and Page Down to move between sheets (Command on a Mac).
 - Suggested presets: when a file matches the size a preset was made for, it offers "Use" under the preset list.
 - Pieces can be turned 90 degrees, and "Head-to-head" turns every other row upside down for tent cards and folded pieces.
-- "Pull in to cut lines" sets the gutters so the cards' cut lines just meet. It reads the cut line from the file's trim box, or from the file's own crop marks.
-- "Fit most" now pulls in to the cut lines first (or keeps a tighter gutter you set) and tries the pieces turned, then picks whichever fits more.
+- "Fit most" now pulls the cards together the way the shop does: until only a sliver of each file's own crop marks still shows between them, so they can still be cut by. On an Illustrator card with a wide edge that's -0.63"; on a 4.083" x 2.583" card it's about -0.30". Business cards on 12x18 come out 7 x 3 either way. It also tries the pieces turned and picks whichever fits more. A file without crop marks of its own is pulled in until its cut lines meet.
+- Presets saved after Fit most remember "pulled in" rather than a fixed gutter, so they work out the right gutter for each card.
 - The summary shows the size each piece finishes at after cutting, so you can see if a gutter pulls in past the cut line.
-- Crop marks option: none, outside only, or outside plus small marks between pieces. Marks between pieces print on the design, so it warns if a file has artwork at its corners.
+- Crop marks option: none, outside only, or outside plus small marks between pieces. They show in the preview, and the outside marks are shortened if needed so they never fall off the sheet. Marks between pieces print on the design, so it warns if a file has artwork at its corners.
 
 ## 1.1.0 (2026-10-01)
 

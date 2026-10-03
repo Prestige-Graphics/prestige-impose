@@ -37,6 +37,13 @@ def _checks():
     assert presets, "no shared presets bundled"
     yield f"{len(presets)} preset(s)"
 
+    from .fiery import load_config
+    from .paths import FIERY_FILE
+    assert FIERY_FILE.is_file(), "presets/fiery.json not bundled"
+    presses, papers = load_config()
+    assert len(presses) >= 2, "Fiery presses missing"
+    yield f"{len(presses)} Fiery press(es), {len(papers) - 1} paper(s)"
+
     # A 2-page card with a real image, imposed 7 x 3 duplex with negative gutters.
     src = fitz.open()
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 60, 40), False)

@@ -15,6 +15,7 @@ IS_MAC = sys.platform == "darwin"
 RESOURCES = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 
 PRESETS_FILE = RESOURCES / "presets" / "shared_presets.json"
+FIERY_FILE = RESOURCES / "presets" / "fiery.json"      # presses and papers for Send to Fiery
 ICON_ICO = RESOURCES / "assets" / "icon.ico"
 
 # Shared presets are edited on the development copy and shipped with each

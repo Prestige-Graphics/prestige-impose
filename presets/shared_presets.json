@@ -13,6 +13,17 @@
     "gutter_y": -0.63,
     "scaling": "none",
     "scale_pct": 100.0,
-    "marks": false
+    "rotate": 0,
+    "head_to_head": false,
+    "crop_marks": "none",
+    "match_size": [
+      4.4167,
+      2.9167
+    ],
+    "match_cut": [
+      3.5,
+      2.0
+    ],
+    "pull_in": true
   }
 }

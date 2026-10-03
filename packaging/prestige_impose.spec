@@ -23,6 +23,7 @@ a = Analysis(
     pathex=[str(ROOT)],
     datas=[
         (str(ROOT / "presets" / "shared_presets.json"), "presets"),
+        (str(ROOT / "presets" / "fiery.json"), "presets"),
         (str(ROOT / "assets" / "icon.ico"), "assets"),
     ] + collect_data_files("tkinterdnd2"),   # the tkdnd drag-and-drop library
     hiddenimports=["certifi", "tkinterdnd2"],

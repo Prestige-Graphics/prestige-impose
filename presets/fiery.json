@@ -1,0 +1,14 @@
+{
+  "_about": "Presses and papers for Send to Fiery. A paper is a Fiery Virtual Printer (set up in Command WorkStation with paper type, weight and Held); list its IPP queue for each press it exists on, e.g. \"ipp/14pt Gloss\".",
+  "presses": [
+    {
+      "name": "Press 1 - C4070",
+      "host": "192.168.2.67"
+    },
+    {
+      "name": "Press 2 - C4070NEW",
+      "host": "192.168.2.71"
+    }
+  ],
+  "papers": []
+}

@@ -17,10 +17,11 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import pymupdf as fitz
 
-from . import __version__, updater
+from . import __version__, fiery, updater
 from .engine import (PT, SHEET_MARGIN_IN, SHEETS, Settings, best_fit, delete_preset,
-                     describe, finish_rect, has_bleed, load_presets, most_that_fit, plan,
-                     presets_for_size, pull_in_gutters, render, render_preview, save_preset)
+                     describe, finish_rect, has_bleed, load_presets,
+                     most_that_fit, outer_spare, plan, presets_for_file, pull_in_gutters,
+                     render, render_preview, save_preset, settings_for_file, trim_rect)
 from .paths import CAN_EDIT_PRESETS, ICON_ICO, IS_MAC, IS_WINDOWS
 
 CUSTOM = "Custom"
@@ -116,6 +117,8 @@ class App(_BaseTk):
         self.file_label.pack(side="left", padx=10)
         self.save_btn = ttk.Button(top, text="Save imposed PDF", command=self.save)
         self.save_btn.pack(side="right")
+        self.send_btn = ttk.Button(top, text="Send to Fiery...", command=self.send_to_fiery)
+        self.send_btn.pack(side="right", padx=(0, 6))
         # Shown only when a newer version is out.
         self.update_btn = ttk.Button(top, text="", style="Update.TButton",
                                      command=self.show_update)
@@ -287,8 +290,6 @@ class App(_BaseTk):
             row=0, column=4, padx=(6, 0))
         ttk.Button(g, text="Reset", width=9, command=self.reset_gutters).grid(
             row=1, column=4, padx=(6, 0))
-        self.pull_btn = ttk.Button(g, text="Pull in to cut lines", command=self.pull_in)
-        self.pull_btn.grid(row=2, column=1, columnspan=4, sticky="w", pady=(4, 0))
 
         ttk.Separator(p).pack(fill="x", pady=6)
         sc = ttk.Frame(p)
@@ -365,6 +366,8 @@ class App(_BaseTk):
     def apply_preset(self):
         s = self.presets.get(self.preset_var.get())
         if s is not None:
+            if self.src:
+                s = settings_for_file(self.src, s)
             self._apply_settings(s)
             if hasattr(self, "suggest_row"):
                 self.suggest_row.pack_forget()
@@ -413,7 +416,12 @@ class App(_BaseTk):
         if name in self.presets and not messagebox.askyesno(
                 "Replace preset?", f"A preset called '{name}' already exists. Replace it?"):
             return
-        save_preset(name, s, match_size=self._file_size())
+        # Gutters that are the file's pull-in gutters are saved as "pull in", so
+        # the preset works for cards with more or less slug around them.
+        if self.src:
+            g = pull_in_gutters(self.src, s)
+            s.pull_in = bool(g) and abs(g[0] - s.gutter_x) < 0.005 and abs(g[1] - s.gutter_y) < 0.005
+        save_preset(name, s, match_size=self._file_size(), match_cut=self._cut_size())
         self._load_presets(select=name)
 
     def delete_preset(self):
@@ -431,9 +439,15 @@ class App(_BaseTk):
         r = self.src[0].rect
         return (r.width / PT, r.height / PT)
 
+    def _cut_size(self):
+        """(w, h) inches of where the open file's first page is cut, or None."""
+        if not self.src:
+            return None
+        t = trim_rect(self.src[0])
+        return (t.width / PT, t.height / PT)
+
     def _update_suggestion(self):
-        size = self._file_size()
-        names = presets_for_size(*size) if size else []
+        names = presets_for_file(self.src) if self.src else []
         names = [n for n in names if n in self.presets]
         self._suggested = names[0] if names else None
         if self._suggested and self.preset_var.get() != self._suggested:
@@ -447,26 +461,6 @@ class App(_BaseTk):
             self.preset_var.set(self._suggested)
             self.apply_preset()
             self.suggest_row.pack_forget()
-
-    def pull_in(self):
-        """Set both gutters so the pieces' cut lines just meet."""
-        if not self.src:
-            return
-        try:
-            s = self.settings()
-        except ValueError as e:
-            messagebox.showerror("Check the settings", str(e))
-            return
-        g = pull_in_gutters(self.src, s)
-        if g is None:
-            messagebox.showinfo(
-                "No cut lines found",
-                "This file has no cut line inside the page to pull in to: no trim box, "
-                "and no crop marks of its own. Set the gutters by hand.")
-            return
-        self._set_gutter("gutter_x", g[0])
-        self._set_gutter("gutter_y", g[1])
-        self._schedule()
 
     def _bind_shortcuts(self):
         mods = ("Control", "Command") if IS_MAC else ("Control",)
@@ -575,13 +569,23 @@ class App(_BaseTk):
         """
         if not self.src or not self.plan or self.plan.errors:
             return
+        dest = self._write_imposed()
+        if dest:
+            reveal(dest)
+            self._notes([("ok", f"Saved: {dest.name}\nin {dest.parent}")])
+
+    def _imposed_path(self):
         s = self.plan.settings
         w, h = s.sheet_size()
-        name = f"{self.src_path.stem} - imposed {w:g}x{h:g} {s.rows}x{s.cols}.pdf"
-        dest = self.src_path.parent / name
-        if dest.exists() and not messagebox.askyesno(
+        return self.src_path.parent / f"{self.src_path.stem} - imposed {w:g}x{h:g} {s.rows}x{s.cols}.pdf"
+
+    def _write_imposed(self, ask_replace=True):
+        """Write the imposed PDF next to the original. Returns its path, or None."""
+        dest = self._imposed_path()
+        name = dest.name
+        if ask_replace and dest.exists() and not messagebox.askyesno(
                 "Replace?", f"{name} already exists in\n{dest.parent}\n\nReplace it?"):
-            return
+            return None
         part = dest.with_name(dest.name + ".part")
         try:
             doc = render(self.src, self.plan)
@@ -591,9 +595,127 @@ class App(_BaseTk):
         except Exception as e:
             part.unlink(missing_ok=True)
             messagebox.showerror("Save failed", f"{name}\n\n{e}")
+            return None
+        return dest
+
+    # ---------------------------------------------------------- send to Fiery
+
+    def send_to_fiery(self):
+        """
+        Pick a press, paper, quantity, tray and colour; save the imposed PDF
+        next to the original and send it to that press's Held queue. Clicking
+        Send is the go-ahead (nothing prints: it waits in Held).
+        """
+        if not self.src or not self.plan or self.plan.errors:
             return
-        reveal(dest)
-        self._notes([("ok", f"Saved: {name}\nin {dest.parent}")])
+        plan_ = self.plan
+        presses, papers = fiery.load_config()
+        win = tk.Toplevel(self)
+        win.title("Send to Fiery")
+        win.transient(self)
+        win.resizable(False, False)
+        f = ttk.Frame(win, padding=14)
+        f.pack(fill="both", expand=True)
+
+        press_var = tk.StringVar(value=presses[0].name)
+        paper_var = tk.StringVar(value=papers[0].name)
+        name_var = tk.StringVar(value=self.src_path.stem)
+        qty_var = tk.StringVar(value=str(plan_.per_sheet if plan_.settings.gang == "repeat"
+                                         and plan_.settings.layout == "gangup" else 1))
+        tray_var = tk.StringVar(value="Auto")
+        colour_var = tk.StringVar(value="Colour")
+        repeat = plan_.settings.layout == "gangup" and plan_.settings.gang == "repeat"
+
+        def row(r, label, widget):
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 10))
+            widget.grid(row=r, column=1, sticky="we", pady=4)
+
+        row(0, "Press:", ttk.Combobox(f, textvariable=press_var, state="readonly", width=44,
+                                      values=[p.name for p in presses]))
+        paper_box = ttk.Combobox(f, textvariable=paper_var, state="readonly", width=44)
+        row(1, "Paper:", paper_box)
+        row(2, "Job name:", ttk.Entry(f, textvariable=name_var, width=46))
+        qf = ttk.Frame(f)
+        ttk.Entry(qf, textvariable=qty_var, width=8).pack(side="left")
+        ttk.Label(qf, text=" pieces" if repeat else " sets").pack(side="left")
+        row(3, "Quantity:", qf)
+        sheets_lbl = ttk.Label(f, text="", style="Small.TLabel")
+        sheets_lbl.grid(row=4, column=1, sticky="w")
+        row(5, "Tray:", ttk.Combobox(f, textvariable=tray_var, state="readonly", width=12,
+                                     values=list(fiery.TRAYS)))
+        row(6, "Colour:", ttk.Combobox(f, textvariable=colour_var, state="readonly", width=12,
+                                       values=list(fiery.COLOURS)))
+        status = ttk.Label(f, text="", style="Small.TLabel", wraplength=420)
+        status.grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        btns = ttk.Frame(f)
+        btns.grid(row=9, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+        send_btn = ttk.Button(btns, text="Send to Held")
+        send_btn.pack(side="right", padx=(0, 6))
+
+        def press():
+            return next(p for p in presses if p.name == press_var.get())
+
+        def refresh(*_):
+            # Only papers set up on this press.
+            names = [pp.name for pp in papers if pp.queue_for(press())]
+            paper_box.configure(values=names)
+            if paper_var.get() not in names:
+                paper_var.set(names[0])
+            try:
+                _, label = fiery.copies_for(plan_, int(qty_var.get()))
+                sheets_lbl.configure(text="= " + label, foreground="")
+                send_btn.configure(state="normal")
+            except ValueError:
+                sheets_lbl.configure(text="Type a whole number.", foreground="#b00")
+                send_btn.configure(state="disabled")
+
+        for v in (press_var, qty_var):
+            v.trace_add("write", refresh)
+        refresh()
+
+        def do_send():
+            pr = press()
+            paper = next(pp for pp in papers if pp.name == paper_var.get())
+            copies, label = fiery.copies_for(plan_, int(qty_var.get()))
+            job = name_var.get().strip() or self.src_path.stem
+            dest = self._write_imposed()
+            if not dest:
+                return
+            send_btn.configure(state="disabled")
+            status.configure(text=f"Sending to {pr.name}...", foreground="")
+            pdf = dest.read_bytes()
+            args = dict(press=pr, queue=paper.queue_for(pr), pdf=pdf, job_name=job,
+                        copies=copies, sides=fiery.sides_for(plan_), sheet_pt=plan_.sheet,
+                        tray=fiery.TRAYS[tray_var.get()], colour=fiery.COLOURS[colour_var.get()])
+
+            def work():
+                try:
+                    job_id = fiery.send(**args)
+                    self.after(0, lambda: done(pr, job, job_id, label, dest))
+                except fiery.SendError as e:
+                    msg = str(e)
+                    self.after(0, lambda: failed(msg))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def done(pr, job, job_id, label, dest):
+            if win.winfo_exists():
+                win.destroy()
+            jid = f" as job {job_id}" if job_id else ""
+            text = (f"Sent to {pr.name} Held queue{jid}: {job}, {label}.\n"
+                    f"Saved: {dest.name} in {dest.parent}")
+            self._notes([("ok", text)])
+            messagebox.showinfo("Sent to Fiery", text, parent=self)
+
+        def failed(msg):
+            if win.winfo_exists():
+                status.configure(text=msg, foreground="#b00")
+                send_btn.configure(state="normal")
+
+        send_btn.configure(command=do_send)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.grab_set()
 
     # -------------------------------------------------------------- updates
 
@@ -675,8 +797,9 @@ class App(_BaseTk):
 
     def fit_most(self):
         """
-        Most pieces on the sheet, the way the shop does it: pull in to the cut
-        lines (or keep a tighter gutter already set), and try the pieces turned.
+        Most pieces on the sheet, the way the shop does it: pull in until only a
+        sliver of the file's own crop marks shows (or the cut lines meet, if it
+        has none), and try the pieces turned.
         """
         if not self.src:
             return
@@ -731,6 +854,7 @@ class App(_BaseTk):
                                     font=(UI_FONT, 14), fill="#444")
             self._set_nav(0)
             self.save_btn.configure(state="disabled")
+            self.send_btn.configure(state="disabled")
             self._notes([])
             return
 
@@ -739,12 +863,13 @@ class App(_BaseTk):
         except ValueError as e:
             self._notes([("err", str(e))])
             self.save_btn.configure(state="disabled")
+            self.send_btn.configure(state="disabled")
             return
 
         self.plan = p = plan(self.src, s)
         self.sheet_index = min(self.sheet_index, max(0, p.sheet_count - 1))
 
-        # Hint: how many fit, pieces upright and turned, pulled in to the cut lines.
+        # Hint: how many fit, pieces upright and turned, pulled in the way Fit most does.
         fin = finish_rect(self.src[0], s.finish)
         k = s.scale_pct / 100 if s.scaling == "custom" else 1.0
         hints = []
@@ -752,12 +877,10 @@ class App(_BaseTk):
             s2 = Settings(**{**s.__dict__, "rotate": rot})
             pull = pull_in_gutters(self.src, s2)
             if pull:
-                s2.gutter_x, s2.gutter_y = min(s2.gutter_x, pull[0]), min(s2.gutter_y, pull[1])
-            r, c = most_that_fit(s2, fin.width, fin.height, k)
+                s2.gutter_x, s2.gutter_y = pull
+            r, c = most_that_fit(s2, fin.width, fin.height, k, outer_spare(self.src, s2))
             hints.append(f"{label} {r} x {c} = {r * c}")
-        pulled = " (pulled in to cut lines)" if pull_in_gutters(self.src, s) else ""
-        self.fit_hint.configure(text=f"Most that fit{pulled}: " + ",  ".join(hints))
-        self.pull_btn.configure(state="normal" if pull_in_gutters(self.src, s) else "disabled")
+        self.fit_hint.configure(text="Most that fit: " + ",  ".join(hints))
 
         lines = [("", describe(p, self.src.page_count))]
         lines += [("err", "ERROR: " + e) for e in p.errors]
@@ -766,6 +889,7 @@ class App(_BaseTk):
             lines.append(("ok", "Ready. Nothing to check."))
         self._notes(lines)
         self.save_btn.configure(state="disabled" if p.errors else "normal")
+        self.send_btn.configure(state="disabled" if p.errors else "normal")
         self._set_nav(p.sheet_count)
 
         self._notes_lines = lines

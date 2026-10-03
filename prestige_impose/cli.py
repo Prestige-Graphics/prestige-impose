@@ -6,7 +6,7 @@ and presets as the window.
     python -m prestige_impose.cli "<file.pdf>" --preset "..." --rows 8       # preset, one change
     python -m prestige_impose.cli "<file.pdf>" --duplex on --rows 7 --cols 3 --gutter -0.6
     python -m prestige_impose.cli "<file.pdf>" --fit-most --out-dir .tmp/out   # pulls in, tries turning
-    python -m prestige_impose.cli "<file.pdf>" --pull-in --rows 7 --cols 3     # gutters to the cut lines
+    python -m prestige_impose.cli "<file.pdf>" --pull-in --rows 7 --cols 3     # pull in, keep crop marks
     python -m prestige_impose.cli "<file.pdf>" --rotate 90 --head-to-head --marks between
     python -m prestige_impose.cli --list-presets
 
@@ -22,7 +22,7 @@ from pathlib import Path
 import pymupdf as fitz
 
 from .engine import (PT, SHEETS, Settings, best_fit, describe, load_presets, plan,
-                     pull_in_gutters, render)
+                     pull_in_gutters, render, settings_for_file)
 
 
 def parse_sheet(text):
@@ -52,9 +52,10 @@ def main(argv=None):
     ap.add_argument("--rows", type=int)
     ap.add_argument("--cols", type=int)
     ap.add_argument("--fit-most", action="store_true",
-                    help="most pieces that fit: pulls in to the cut lines and tries turning")
+                    help="most pieces that fit: pulls in (keeping the file's crop marks) and tries turning")
     ap.add_argument("--pull-in", action="store_true",
-                    help="set both gutters so the cut lines just meet")
+                    help="pull in until only a little of the file's crop marks shows "
+                         "(or the cut lines meet, if it has none)")
     ap.add_argument("--rotate", type=int, choices=[0, 90], help="turn every piece 90 degrees")
     ap.add_argument("--head-to-head", action="store_true", help="turn every other row upside down")
     ap.add_argument("--gutter", type=float, help="inches, both directions (negative = overlap)")
@@ -113,6 +114,8 @@ def main(argv=None):
         s.crop_marks = a.marks
 
     src = fitz.open(stream=src_path.read_bytes(), filetype="pdf")
+    if s.pull_in and a.gutter is None and a.gutter_x is None and a.gutter_y is None:
+        s = settings_for_file(src, s)
     if a.pull_in:
         g = pull_in_gutters(src, s)
         if g is None:
