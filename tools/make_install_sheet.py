@@ -40,8 +40,10 @@ isn't registered with Microsoft or Apple, which is what the warning is about.</p
 <h2>4. Using it</h2>
 <p>Open a PDF from the app, or right-click a PDF and choose <b>Open with &gt; Prestige
 Impose</b>. Pick a preset or set the layout, then <b>Save imposed PDF</b>. It saves next
-to the original and shows you the file. Print it to the Fiery as usual and set copies,
-paper and duplex there. The original file is never changed.</p>
+to the original and shows you the file. Or click <b>Send to Fiery</b>: pick the press,
+quantity, tray and colour, and the job lands in that press's <b>Held</b> queue in Command
+WorkStation with copies and duplex already set. Set the paper there, then print. The
+original file is never changed.</p>
 <p>On Windows, right-click Prestige Impose in the Start menu and choose <b>Pin to
 taskbar</b>. On a Mac, right-click it in the Dock and choose <b>Options &gt; Keep in Dock</b>.</p>
 
