@@ -32,7 +32,7 @@ SET_IN_CWS = "Set in Command WorkStation"
 # by size in hundredths of a millimetre, short edge first. Sending the name as
 # well as the size lets it pick its catalogue paper rather than a custom size.
 SIZE_NAMES = {
-    (33020, 48260): "na_super-b_13x19in",
+    (33000, 48300): "na_super-b_13x19in",    # 13x19 is made 330 x 483 mm (engine.PRESS_SIZES)
     (30480, 45720): "na_arch-b_12x18in",
     (27940, 43180): "na_ledger_11x17in",
     (21590, 27940): "na_letter_8.5x11in",

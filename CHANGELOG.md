@@ -3,6 +3,11 @@
 Each version's notes are what staff see in the app's "Update available"
 window. Write them for the person at the press, in plain words.
 
+## 1.2.2 (2026-10-05)
+
+- **13x19 jobs print.** The press's 13x19 is really 330 x 483 mm, a hair different from exactly 13" x 19", so jobs sent from Prestige Impose stopped at the press as a custom size. 13x19 sheets are now made at the press's own size. It's still called 13 x 19 everywhere, and layouts look the same. Tested on Press 1, portrait and landscape.
+- Landscape duplex is confirmed to arrive as left/right bind.
+
 ## 1.2.1 (2026-10-05)
 
 - **Pages panel.** Every page of the file shows as a thumbnail down the left. Drag the divider to widen it and the pages flow into 2, 3 or more columns. Click a page to see the sheet it prints on; Ctrl-click or Shift-click selects several (Cmd on a Mac). Drag pages to move them. Right-click, or the Edit menu above the pages: cut, copy, paste (before or after), duplicate, delete, move to start, move to end, reverse order, insert a blank page, a blank page after every page, insert pages from another PDF, save selected pages as a PDF, select all, undo, and back to the original pages. The usual keys work once you've clicked in the panel: Ctrl+X, C, V, D, A, Z and Delete. A page that isn't the size of the rest is outlined in orange with its size. Only the imposed job changes; the original file is never touched.

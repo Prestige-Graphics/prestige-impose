@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from prestige_impose import fiery
-from prestige_impose.engine import Settings, plan
+from prestige_impose.engine import Settings, describe, plan
 from tests.test_engine import make_marked_pdf, make_pdf
 
 
@@ -123,14 +123,21 @@ def test_auto_tray_sends_no_tray(fake_fiery):
     assert attrs["media-col.media-size.x-dimension"] == 30480     # short edge first
 
 
-def test_13x19_goes_by_the_fierys_name(fake_fiery):
+def test_13x19_is_made_and_sent_at_the_press_size(fake_fiery):
+    """Konica's 13x19 is 330 x 483 mm; exactly 13 x 19 in was refused as a custom
+    size (proved on Press 1, 2026-10-05). Sent with the Fiery's name for it."""
     port, got = fake_fiery
-    press = fiery.Press("Press", "127.0.0.1", port)
-    fiery.send(press, "ipp/hold", b"%PDF", "x", 1, "one-sided", (13 * 72, 19 * 72))
-    attrs, _ = parse_request(got["body"])
-    assert attrs["media-col.media-size-name"] == "na_super-b_13x19in"
-    assert (attrs["media-col.media-size.x-dimension"],
-            attrs["media-col.media-size.y-dimension"]) == (33020, 48260)
+    for orientation in ("portrait", "landscape"):
+        p = plan(make_pdf(1), Settings(sheet_w=13, sheet_h=19, orientation=orientation))
+        assert sorted(round(v / 72 * 25.4, 2) for v in p.sheet) == [330.0, 483.0]
+        fiery.send(fiery.Press("Press", "127.0.0.1", port), "ipp/hold", b"%PDF", "x", 1,
+                   "one-sided", p.sheet)
+        attrs, _ = parse_request(got["body"])
+        assert attrs["media-col.media-size-name"] == "na_super-b_13x19in"
+        assert (attrs["media-col.media-size.x-dimension"],
+                attrs["media-col.media-size.y-dimension"]) == (33000, 48300)
+    # It's still called 13 x 19 everywhere people see it.
+    assert '19" x 13" landscape' in describe(p, 1)
 
 
 def test_custom_sheet_sends_no_name(fake_fiery):

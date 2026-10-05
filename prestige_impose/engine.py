@@ -95,6 +95,12 @@ MARK_SHOW_IN = 0.06
 # sheet edge is left blank: the press can't print there anyway.
 SHEET_MARGIN_IN = 0.1
 
+# The press's own size for a sheet, where it isn't the inch size it's called.
+# Konica's "13x19" is 330 x 483 mm (12.99 x 19.02 in): a sheet made exactly
+# 13 x 19 in reaches the press as a custom size and is refused, so 13x19
+# sheets are made at 330 x 483 mm (proved on Press 1, Leo, 2026-10-05).
+PRESS_SIZES = {(13.0, 19.0): (330 / 25.4, 483 / 25.4)}
+
 SHEETS = {  # name: (width, height) in inches, portrait
     "12 x 18": (12.0, 18.0),
     "13 x 19": (13.0, 19.0),
@@ -139,7 +145,15 @@ class Settings:
         return self.crop_marks in BLEED_MODES
 
     def sheet_size(self):
+        """(w, h) inches as the sheet is called (12 x 18, 13 x 19...), turned."""
         a, b = sorted((self.sheet_w, self.sheet_h))
+        return (a, b) if self.orientation == "portrait" else (b, a)
+
+    def press_size(self):
+        """(w, h) inches the sheet is actually made: the press's own size (see
+        PRESS_SIZES), turned."""
+        a, b = sorted((self.sheet_w, self.sheet_h))
+        a, b = PRESS_SIZES.get((round(a, 3), round(b, 3)), (a, b))
         return (a, b) if self.orientation == "portrait" else (b, a)
 
     @classmethod
@@ -499,7 +513,7 @@ def mark_space():
 
 def usable_area(s):
     """Sheet area left for the grid once the margin and crop marks are allowed for."""
-    w, h = (v * PT for v in s.sheet_size())
+    w, h = (v * PT for v in s.press_size())
     edge = SHEET_MARGIN_IN * PT + (mark_space() if s.marks else 0)
     return w - 2 * edge, h - 2 * edge
 
@@ -513,7 +527,7 @@ def most_that_fit(s, finish_w, finish_h, scale=1.0, spare=None):
     if spare is None:
         aw, ah = usable_area(s)
     else:
-        w, h = (v * PT for v in s.sheet_size())
+        w, h = (v * PT for v in s.press_size())
         m = SHEET_MARGIN_IN * PT
         aw, ah = w - 2 * m + spare[0], h - 2 * m + spare[1]
     cw, ch = finish_w * scale, finish_h * scale
@@ -731,7 +745,7 @@ def plan(src, s):
     if s.adds_bleed:
         s.finish = "trim"   # slots are the cut size; the bleed sits in the gutters
     n_pages = len(src)
-    sheet_w, sheet_h = (v * PT for v in s.sheet_size())
+    sheet_w, sheet_h = (v * PT for v in s.press_size())
     sheet_rect = fitz.Rect(0, 0, sheet_w, sheet_h)
     m = SHEET_MARGIN_IN * PT
     safe = sheet_rect + (m, m, -m, -m)
@@ -927,6 +941,7 @@ def plan(src, s):
     # Bigger than the sheet is allowed (sometimes on purpose); just say so.
     # What has to print is the cuts, crop marks and bleed (see outer_spare);
     # slug beyond a file's own marks may fall in the margin.
+    named = s.sheet_size()
     spx, spy = outer_spare(src, s)
     if s.marks or keeps_own_marks(src):
         needed = grid + (spx / 2, spy / 2, -spx / 2, -spy / 2)
@@ -934,12 +949,12 @@ def plan(src, s):
             warnings.append(
                 f'The layout needs {needed.width / PT:.3f}" x {needed.height / PT:.3f}" '
                 f'with its crop marks, more than fits inside the {SHEET_MARGIN_IN}" margin of '
-                f'the {sheet_w / PT:g}" x {sheet_h / PT:g}" sheet. Whatever falls past the '
+                f'the {named[0]:g}" x {named[1]:g}" sheet. Whatever falls past the '
                 'margin is left blank.')
     elif not sheet_rect.contains(grid):
         warnings.append(
             f'The layout is {grid_w / PT:.3f}" x {grid_h / PT:.3f}", bigger than the '
-            f'{sheet_w / PT:g}" x {sheet_h / PT:g}" sheet. Whatever falls past the '
+            f'{named[0]:g}" x {named[1]:g}" sheet. Whatever falls past the '
             f'{SHEET_MARGIN_IN}" margin is left blank.')
 
     return Plan(settings=s, sheet=(sheet_w, sheet_h), finish=(fw, fh), scale=scale,
@@ -997,7 +1012,7 @@ def describe(plan_, n_pages):
     """One-paragraph summary for the screen and the command line."""
     s = plan_.settings
     fw, fh = (v / PT for v in plan_.finish)
-    sw, sh = (v / PT for v in plan_.sheet)
+    sw, sh = s.sheet_size()   # as it's called (the press's own size is used to make it)
     mode = "Normal" if s.layout == "normal" else f"Gangup, {s.gang}"
     dup = ("duplex, same both sides" if s.duplex and (s.back_same or n_pages == 1)
            else "duplex" if s.duplex else "single-sided")
