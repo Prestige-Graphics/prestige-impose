@@ -7,7 +7,7 @@ and presets as the window.
     python -m prestige_impose.cli "<file.pdf>" --duplex on --rows 7 --cols 3 --gutter -0.6
     python -m prestige_impose.cli "<file.pdf>" --fit-most --out-dir .tmp/out   # pulls in, tries turning
     python -m prestige_impose.cli "<file.pdf>" --pull-in --rows 7 --cols 3     # pull in, keep crop marks
-    python -m prestige_impose.cli "<file.pdf>" --rotate 90 --head-to-head --marks between
+    python -m prestige_impose.cli "<file.pdf>" --rotate 90 --style head --marks stretch
     python -m prestige_impose.cli --list-presets
 
 Anything given on the command line overrides the preset. The output goes to
@@ -57,13 +57,19 @@ def main(argv=None):
                     help="pull in until only a little of the file's crop marks shows "
                          "(or the cut lines meet, if it has none)")
     ap.add_argument("--rotate", type=int, choices=[0, 90], help="turn every piece 90 degrees")
-    ap.add_argument("--head-to-head", action="store_true", help="turn every other row upside down")
+    ap.add_argument("--style", choices=["standard", "head", "foot"],
+                    help="layout style: head to head or foot to foot (pairs of rows)")
+    ap.add_argument("--slot-180", choices=["none", "front", "back", "both"],
+                    help="turn every piece on that surface upside down (top-bound duplex)")
     ap.add_argument("--gutter", type=float, help="inches, both directions (negative = overlap)")
     ap.add_argument("--gutter-x", type=float, help="inches between columns")
     ap.add_argument("--gutter-y", type=float, help="inches between rows")
     ap.add_argument("--scale", help="none, fit, or a percentage like 95")
-    ap.add_argument("--marks", nargs="?", const="outside", choices=["none", "outside", "between"],
-                    help="crop marks: outside the layout, or also between pieces (off by default)")
+    ap.add_argument("--marks", nargs="?", const="outside",
+                    choices=["none", "outside", "stretch", "enlarge"],
+                    help="crop marks outside the layout; stretch/enlarge also keep 0.125\" of "
+                         "bleed round each piece, making it (mirrored edges, or enlarged) if "
+                         "the file has none (off by default)")
     ap.add_argument("--out-dir", default=".", help="folder for the imposed PDF")
     a = ap.parse_args(argv)
 
@@ -108,8 +114,10 @@ def main(argv=None):
         s.scaling = "none"
     elif a.scale:
         s.scaling, s.scale_pct = "custom", float(a.scale.rstrip("%"))
-    if a.head_to_head:
-        s.head_to_head = True
+    if a.style:
+        s.layout_style = a.style
+    if a.slot_180:
+        s.slot_180 = a.slot_180
     if a.marks:
         s.crop_marks = a.marks
 

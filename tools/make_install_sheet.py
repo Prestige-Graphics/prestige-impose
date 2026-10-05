@@ -44,6 +44,8 @@ to the original and shows you the file. Or click <b>Send to Fiery</b>: pick the 
 quantity, tray and colour, and the job lands in that press's <b>Held</b> queue in Command
 WorkStation with copies and duplex already set. Set the paper there, then print. The
 original file is never changed.</p>
+<p><b>Presets</b> are your own: set up a layout you use often and click <b>Save...</b>
+next to Preset. They stay through updates.</p>
 <p>On Windows, right-click Prestige Impose in the Start menu and choose <b>Pin to
 taskbar</b>. On a Mac, right-click it in the Dock and choose <b>Options &gt; Keep in Dock</b>.</p>
 

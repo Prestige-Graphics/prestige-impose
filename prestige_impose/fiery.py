@@ -28,6 +28,20 @@ TRAYS = {"Auto": None, "Tray 1": "tray-1", "Tray 2": "tray-2", "Tray 3": "tray-3
 COLOURS = {"Colour": "color", "Grayscale": "monochrome"}
 SET_IN_CWS = "Set in Command WorkStation"
 
+# The Fiery's own names for its sheet sizes (from its media-supported list),
+# by size in hundredths of a millimetre, short edge first. Sending the name as
+# well as the size lets it pick its catalogue paper rather than a custom size.
+SIZE_NAMES = {
+    (33020, 48260): "na_super-b_13x19in",
+    (30480, 45720): "na_arch-b_12x18in",
+    (27940, 43180): "na_ledger_11x17in",
+    (21590, 27940): "na_letter_8.5x11in",
+    (21590, 35560): "na_legal_8.5x14in",
+    (32000, 45000): "iso_sra3_320x450mm",
+    (29700, 42000): "iso_a3_297x420mm",
+    (21000, 29700): "iso_a4_210x297mm",
+}
+
 # What staff see if presets/fiery.json is missing.
 DEFAULT_PRESSES = [
     {"name": "Press 1 - C4070", "host": "192.168.2.67"},
@@ -86,12 +100,14 @@ def copies_for(plan_, quantity):
 
 
 def sides_for(plan_):
-    """IPP two-sided setting matching how the backs were laid out (mirrored
-    left/right, so the sheet turns on its left/right edge)."""
-    if not plan_.settings.duplex:
-        return "one-sided"
-    w, h = plan_.sheet
-    return "two-sided-long-edge" if h >= w else "two-sided-short-edge"
+    """
+    IPP two-sided setting. Backs are always laid out mirrored left/right
+    (the sheet turns on its left/right edge, as you look at it), which the
+    Fiery calls left bind / Top-Top for portrait and landscape sheets alike.
+    It reads "short edge" as top bind, so that's never sent (Leo, 2026-10-05:
+    landscape jobs arrived as top bind).
+    """
+    return "two-sided-long-edge" if plan_.settings.duplex else "one-sided"
 
 
 # ------------------------------------------------------------------- IPP wire
@@ -116,6 +132,9 @@ def _media_col(sheet_pt, tray):
     size = (_attr(0x34, "", b"") + _member(0x21, "x-dimension", a)
             + _member(0x21, "y-dimension", b) + _attr(0x37, "", b""))
     body = _attr(0x34, "media-col", b"") + _attr(0x4A, "", "media-size") + size
+    name = SIZE_NAMES.get((a, b))
+    if name:
+        body += _member(0x44, "media-size-name", name)
     if tray:
         body += _member(0x44, "media-source", tray)
     return body + _attr(0x37, "", b"")

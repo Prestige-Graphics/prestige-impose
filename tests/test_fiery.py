@@ -26,8 +26,9 @@ def test_sides_follow_the_sheet():
     src = make_pdf(2)
     assert fiery.sides_for(plan(src, Settings(duplex=False))) == "one-sided"
     assert fiery.sides_for(plan(src, Settings(duplex=True))) == "two-sided-long-edge"
+    # Landscape too: the Fiery reads short-edge as top bind.
     assert fiery.sides_for(plan(src, Settings(duplex=True, orientation="landscape"))) == \
-        "two-sided-short-edge"
+        "two-sided-long-edge"
 
 
 def parse_request(data):
@@ -109,6 +110,7 @@ def test_send_puts_everything_on_the_job(fake_fiery, monkeypatch):
     assert attrs["media-col.media-size.x-dimension"] == 30480     # 12" in 1/100 mm
     assert attrs["media-col.media-size.y-dimension"] == 45720     # 18"
     assert attrs["media-col.media-source"] == "tray-2"
+    assert attrs["media-col.media-size-name"] == "na_arch-b_12x18in"
     assert attrs["print-color-mode"] == "color"
 
 
@@ -119,6 +121,24 @@ def test_auto_tray_sends_no_tray(fake_fiery):
     attrs, _ = parse_request(got["body"])
     assert "media-col.media-source" not in attrs
     assert attrs["media-col.media-size.x-dimension"] == 30480     # short edge first
+
+
+def test_13x19_goes_by_the_fierys_name(fake_fiery):
+    port, got = fake_fiery
+    press = fiery.Press("Press", "127.0.0.1", port)
+    fiery.send(press, "ipp/hold", b"%PDF", "x", 1, "one-sided", (13 * 72, 19 * 72))
+    attrs, _ = parse_request(got["body"])
+    assert attrs["media-col.media-size-name"] == "na_super-b_13x19in"
+    assert (attrs["media-col.media-size.x-dimension"],
+            attrs["media-col.media-size.y-dimension"]) == (33020, 48260)
+
+
+def test_custom_sheet_sends_no_name(fake_fiery):
+    port, got = fake_fiery
+    fiery.send(fiery.Press("Press", "127.0.0.1", port), "ipp/hold", b"%PDF", "x", 1,
+               "one-sided", (10 * 72, 14 * 72))
+    attrs, _ = parse_request(got["body"])
+    assert "media-col.media-size-name" not in attrs
 
 
 def test_unreachable_press_says_so():

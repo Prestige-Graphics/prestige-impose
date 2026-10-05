@@ -59,11 +59,29 @@ def test_unique_duplex_back_sits_behind_front():
     assert p2[0] > out[1].rect.width / 2     # mirrored to the right half
 
 
-def test_normal_duplex_reading_order():
+def test_normal_is_one_page_per_sheet_in_order():
     src = make_pdf(8)
-    out = render(src, plan(src, Settings(layout="normal", duplex=True, **LETTER_2x2)))
-    assert [w[2] for w in sorted(words(out[0]), key=lambda w: (w[1], w[0]))] == ["p1", "p2", "p3", "p4"]
-    assert [w[2] for w in sorted(words(out[1]), key=lambda w: (w[1], w[0]))] == ["p5", "p6", "p7", "p8"]
+    # Rows, columns and gutters left over from a gangup layout don't apply.
+    p = plan(src, Settings(layout="normal", duplex=True, gutter_x=-0.5, **LETTER_2x2))
+    assert p.per_sheet == 1 and p.sheet_count == 4 and not p.errors
+    out = render(src, p)
+    assert [[w[2] for w in words(pg)] for pg in out[:4]] == [["p1"], ["p2"], ["p3"], ["p4"]]
+    assert "one page per sheet" in describe(p, 8)
+
+
+def test_normal_turned_90_backs_line_up_with_fronts():
+    """Bug A: a turned document's backs came out upside down."""
+    front, back = plan(make_pdf(2), Settings(layout="normal", duplex=True, rotate=90)).sides[0]
+    assert [pl.angle for pl in front] == [90] and [pl.angle for pl in back] == [270]
+
+
+def test_head_to_head_needs_two_rows():
+    """Bug B: with one row there's nothing to pair, so nothing turns."""
+    front, _ = plan(make_pdf(1), Settings(rows=1, cols=3, layout_style="head")).sides[0]
+    assert {pl.angle for pl in front} == {0}
+    front, _ = plan(make_pdf(1), Settings(rows=3, cols=1, rotate=90,
+                                          layout_style="foot")).sides[0]
+    assert {pl.angle for pl in front} == {90}
 
 
 def test_negative_gutter_trims_overlap_no_bleed_file():
@@ -182,12 +200,13 @@ def page_pixels(page, zoom):
     return page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
 
 
-@pytest.mark.parametrize("rotate,h2h", [(0, False), (90, False), (0, True), (90, True)])
-def test_preview_matches_saved_pdf_turned(rotate, h2h):
+@pytest.mark.parametrize("rotate,style,s180", [(0, "standard", "none"), (90, "standard", "none"),
+                                               (0, "head", "back"), (90, "foot", "both")])
+def test_preview_matches_saved_pdf_turned(rotate, style, s180):
     """The on-screen preview and the saved PDF agree, for every turn and both sides."""
     src = make_pdf(2, bleed_in=0.125, image=True)
     p = plan(src, Settings(duplex=True, rows=4, cols=3, finish="trim", rotate=rotate,
-                           head_to_head=h2h))
+                           layout_style=style, slot_180=s180))
     assert not p.errors
     z = 0.5
     saved = render(src, p)
@@ -206,14 +225,47 @@ def test_rotate_90_turns_the_slots():
     assert pl.angle == 90
 
 
-def test_head_to_head_turns_every_other_row_and_backs_follow():
+def angles_by_row(entries):
+    rows = sorted({round(pl.visible.y0) for pl in entries})
+    by = {round(pl.visible.y0): pl.angle for pl in entries}
+    return [by[r] for r in rows]
+
+
+def test_head_to_head_and_foot_to_foot_and_backs_follow():
     src = make_pdf(2)
-    p = plan(src, Settings(duplex=True, rows=4, cols=2, head_to_head=True))
-    front, back = p.sides[0]
-    rows = sorted({round(pl.visible.y0) for pl in front})
-    angle_by_row = {round(pl.visible.y0): pl.angle for pl in front}
-    assert [angle_by_row[r] for r in rows] == [0, 180, 0, 180]
-    assert sorted(pl.angle for pl in back) == sorted(pl.angle for pl in front)
+    # Head to head: row 1 upside down, row 2 upright, so their tops meet.
+    front, back = plan(src, Settings(duplex=True, rows=4, cols=2, layout_style="head")).sides[0]
+    assert angles_by_row(front) == [180, 0, 180, 0]
+    assert angles_by_row(back) == angles_by_row(front)
+    # Foot to foot: row 2 upside down, so the bottoms of rows 1 and 2 meet.
+    front, _ = plan(src, Settings(duplex=True, rows=4, cols=2, layout_style="foot")).sides[0]
+    assert angles_by_row(front) == [0, 180, 0, 180]
+
+
+def test_head_to_head_turned_90_pairs_columns():
+    src = make_pdf(1)
+    front, _ = plan(src, Settings(rows=1, cols=4, rotate=90, layout_style="head")).sides[0]
+    by_col = [pl.angle for pl in sorted(front, key=lambda pl: pl.visible.x0)]
+    assert by_col == [90, 270, 90, 270]   # tops of columns 1 and 2 meet in the middle
+
+
+def test_old_head_to_head_preset_keeps_its_look():
+    assert Settings.from_dict({"head_to_head": True}).layout_style == "foot"
+    assert Settings.from_dict({"head_to_head": False}).layout_style == "standard"
+
+
+@pytest.mark.parametrize("surface,front_turned,back_turned",
+                         [("none", False, False), ("front", True, False),
+                          ("back", False, True), ("both", True, True)])
+def test_180_slot_rotation(surface, front_turned, back_turned):
+    src = make_pdf(2)
+    front, back = plan(src, Settings(duplex=True, rows=2, cols=2, slot_180=surface)).sides[0]
+    assert {pl.angle for pl in front} == {180 if front_turned else 0}
+    assert {pl.angle for pl in back} == {180 if back_turned else 0}
+    # Normal layout too (its backs aren't mirrored).
+    _, back = plan(make_pdf(8), Settings(layout="normal", duplex=True, slot_180=surface,
+                                         **LETTER_2x2)).sides[0]
+    assert {pl.angle for pl in back} == {180 if back_turned else 0}
 
 
 def test_turned_backs_turn_the_other_way():
@@ -293,21 +345,63 @@ def test_finished_size_shows_over_pulling():
     assert "Pieces finish at 3.453" in describe(tight, 1)
 
 
-def test_crop_marks_between_warns_on_inked_corners():
-    inked = make_pdf(1, bleed_in=0.125)          # dark all the way to the edge
-    p = plan(inked, Settings(rows=2, cols=2, finish="trim", crop_marks="between"))
-    assert any("artwork at its corners" in w for w in p.warnings)
-    clean = make_marked_pdf()                    # white corners
-    p2 = plan(clean, Settings(rows=2, cols=2, gutter_x=-0.5833, gutter_y=-0.5833,
-                              crop_marks="between"))
-    assert not any("corners" in w for w in p2.warnings)
-    lines = engine.between_lines(p2.sides[0][0])
-    assert len(lines) >= 4
+def test_crop_marks_with_bleed_keep_an_eighth_around_each_piece():
+    src = make_pdf(1, bleed_in=0.25)             # 3.5 x 2 card with 0.25" of bleed
+    for mode in ("stretch", "enlarge"):          # the file has bleed: both just use it
+        p = plan(src, Settings(rows=2, cols=2, gutter_x=0.25, gutter_y=0.25, crop_marks=mode))
+        assert not p.warnings and p.source is src
+        for pl in p.sides[0][0]:
+            assert (round(pl.cut.width / PT, 3), round(pl.cut.height / PT, 3)) == (3.5, 2.0)
+            assert (round(pl.visible.width / PT, 3), round(pl.visible.height / PT, 3)) ==                 (3.75, 2.25)
+        # Cut to cut is the gutter: the slots are the cut size, not the page.
+        xs = sorted({round(pl.cut.x0 / PT, 3) for pl in p.sides[0][0]})
+        assert round(xs[1] - xs[0], 3) == 3.75
+
+
+def bleed_is_inked(page, pl):
+    """Sample the bleed just outside the cut, on all four sides, on the saved sheet."""
+    c, d = pl.cut, 0.06 * PT
+    for x, y in ((c.x0 - d, (c.y0 + c.y1) / 2), (c.x1 + d, (c.y0 + c.y1) / 2),
+                 ((c.x0 + c.x1) / 2, c.y0 - d), ((c.x0 + c.x1) / 2, c.y1 + d),
+                 (c.x0 - d, c.y0 - d)):
+        pix = page.get_pixmap(clip=fitz.Rect(x - 1, y - 1, x + 1, y + 1), dpi=72,
+                              colorspace=fitz.csGRAY, alpha=False)
+        if max(pix.samples) > 120:
+            return False
+    return True
+
+
+@pytest.mark.parametrize("mode", ["stretch", "enlarge"])
+def test_bleed_made_for_a_file_without_any(mode):
+    src = make_pdf(1)                            # 3.5 x 2, dark to the edge, no bleed
+    p = plan(src, Settings(rows=2, cols=2, gutter_x=0.25, gutter_y=0.25, crop_marks=mode))
+    assert any("has no bleed" in w for w in p.warnings)
+    pl = p.sides[0][0][0]
+    assert (round(pl.cut.width / PT, 3), round(pl.cut.height / PT, 3)) == (3.5, 2.0)
+    assert (round(pl.visible.width / PT, 3), round(pl.visible.height / PT, 3)) == (3.75, 2.25)
+    out = render(src, p)
+    assert bleed_is_inked(out[0], pl)
+    assert out[0].get_drawings()                 # crop marks
+    # The label "p1" sits 20pt in from the edge: stretch leaves it there, enlarge moves it.
+    x = min(w[0] for w in out[0].get_text("words") if w[4] == "p1") - pl.cut.x0
+    if mode == "stretch":
+        assert abs(x - 20) < 1
+    else:
+        assert x < 19
+
+
+def test_crop_marks_with_bleed_warns_on_tight_gutters():
+    tight = plan(make_pdf(1, bleed_in=0.25), Settings(rows=2, cols=2, crop_marks="stretch"))
+    assert any("cut the bleed short" in w for w in tight.warnings)
+
+
+def test_old_crop_mark_choices():
+    assert Settings.from_dict({"crop_marks": "between"}).crop_marks == "outside"
 
 
 def test_crop_marks_drawn_only_when_asked():
     src = make_pdf(1)
-    for mode, expect in (("none", 0), ("outside", 1), ("between", 1)):
+    for mode, expect in (("none", 0), ("outside", 1), ("stretch", 1), ("enlarge", 1)):
         out = render(src, plan(src, Settings(rows=2, cols=2, gutter_x=0.25, gutter_y=0.25,
                                              crop_marks=mode)))
         n = sum(1 for d in out[0].get_drawings() for it in d["items"] if it[0] == "l")
@@ -369,3 +463,36 @@ def test_crop_marks_show_in_preview_and_stay_on_the_sheet():
     off = render_preview(src, plan(src, Settings(rows=7, cols=3, gutter_x=-0.63,
                                                  gutter_y=-0.63)), 0, zoom, {})[0]
     assert off.pixel(x, y) != (0, 0, 0)
+
+
+def test_one_page_duplex_prints_same_both_sides():
+    src = make_pdf(1)
+    p = plan(src, Settings(duplex=True, rows=7, cols=3))
+    assert p.sheet_count == 1 and not p.errors
+    assert any("same page prints on both sides" in w for w in p.warnings)
+    out = render(src, p)
+    assert len(out) == 2
+    assert {t for _, _, t in words(out[1])} == {"p1"} and len(words(out[1])) == 21
+    assert "same both sides" in describe(p, 1)
+
+
+def test_same_both_sides_unique_backs_behind_fronts():
+    src = make_pdf(3)
+    p = plan(src, Settings(layout="gangup", gang="unique", duplex=True, back_same=True,
+                           **LETTER_2x2))
+    assert not any("odd" in w for w in p.warnings)
+    out = render(src, p)
+    assert len(out) == 2
+    front, back = words(out[0]), words(out[1])
+    assert sorted(t for *_, t in front) == sorted(t for *_, t in back) == ["p1", "p2", "p3"]
+    p1f = next(w for w in front if w[2] == "p1")
+    p1b = next(w for w in back if w[2] == "p1")
+    assert abs(p1f[1] - p1b[1]) < 2 and p1b[0] > out[1].rect.width / 2   # mirrored
+
+
+def test_same_both_sides_repeat_multi_page():
+    src = make_pdf(2)
+    p = plan(src, Settings(duplex=True, back_same=True, rows=7, cols=3))
+    assert p.sheet_count == 2
+    out = render(src, p)
+    assert [{t for *_, t in words(pg)} for pg in out] == [{"p1"}, {"p1"}, {"p2"}, {"p2"}]

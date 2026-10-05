@@ -8,6 +8,7 @@ Every file opened starts from the default settings; pick a preset after.
 """
 
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -17,21 +18,23 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import pymupdf as fitz
 
-from . import __version__, fiery, updater
-from .engine import (PT, SHEET_MARGIN_IN, SHEETS, Settings, best_fit, delete_preset,
-                     describe, finish_rect, has_bleed, load_presets,
-                     most_that_fit, outer_spare, plan, presets_for_file, pull_in_gutters,
-                     render, render_preview, save_preset, settings_for_file, trim_rect)
-from .paths import CAN_EDIT_PRESETS, ICON_ICO, IS_MAC, IS_WINDOWS
+from . import __version__, fiery, mypresets, pages, updater
+from .engine import (BLEED_IN, PT, SHEET_MARGIN_IN, SHEETS, Settings, delete_preset,
+                     describe, finish_rect, has_bleed, load_presets, plan, presets_for_file,
+                     pull_in_gutters, render, render_preview, save_preset, settings_for_file,
+                     trim_rect)
+from .paths import ICON_ICO, IS_MAC, IS_WINDOWS
 
 CUSTOM = "Custom"
 LAYOUTS = {"Gangup": "gangup", "Normal": "normal"}
 GANGS = {"Repeat": "repeat", "Unique": "unique"}
-FINISHES = {"Based on Crop Box": "crop", "Based on Trim Box": "trim"}
-DUPLEX = {"Off": False, "On": True}
+DUPLEX = {"Off": (False, False), "On": (True, False), "Same both sides": (True, True)}
 SCALING = {"Do not scale": "none", "Scale to fit": "fit", "Custom": "custom"}
-ROTATIONS = {"Upright": 0, "Turned 90\u00b0": 90}
-CROP_MARKS = {"None": "none", "Outside only": "outside", "Outside + between pieces": "between"}
+LAYOUT_STYLES = {"Standard": "standard", "Head to head": "head", "Foot to foot": "foot"}
+SLOT_180 = {"None": "none", "Front surface": "front", "Back surface": "back",
+            "Front and back surface": "both"}
+CROP_MARKS = {"None": "none", "Outside only": "outside",
+              "With bleed (stretch edges)": "stretch", "With bleed (enlarge)": "enlarge"}
 
 try:  # drag and drop (optional: the app works without it)
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -48,6 +51,13 @@ ZOOM_STEP = 1.25     # each zoom in/out click or key press
 ZOOM_MIN_PCT = 10    # % of actual size
 ZOOM_MAX_PCT = 800
 PREVIEW_GAP, PREVIEW_PAD, PREVIEW_LABEL_H = 40, 24, 26
+SHEET_GAP = 56       # between sheets in the all-sheets view
+PAGES_W = 168        # the Pages panel
+THUMB_W, THUMB_H = 112, 132   # largest page thumbnail
+THUMB_GAP = 30       # thumbnail + its page number
+THUMB_COL_GAP = 22   # between columns of thumbnails
+FLAG = "#e07b00"     # a page that isn't the size of the rest
+PREVIEW_MIN_W = 520  # the preview keeps at least this when the Pages panel widens
 
 BG = "#c8c8c8"       # preview backdrop, like Fiery's grey
 PANEL_W = 430
@@ -66,9 +76,19 @@ class App(_BaseTk):
         if IS_WINDOWS and ICON_ICO.is_file():
             self.iconbitmap(default=str(ICON_ICO))
         self.geometry("1280x820")
-        self.minsize(980, 640)
+        self.minsize(1100, 640)
 
-        self.src = None          # open fitz.Document (read into memory)
+        self.src = None          # the document being imposed (the page list, built)
+        self.original = None     # the file as opened (never changed)
+        self.original_bytes = None
+        self.page_tokens = []    # the page list (see pages.py)
+        self.page_sel = []       # selected positions in it
+        self.page_undo = []      # earlier page lists, for Undo
+        self.page_clip = []      # copied / cut pages
+        self._thumbs = {}        # token -> PhotoImage
+        self.extras = {}         # key -> bytes of PDFs inserted ("Insert pages from PDF")
+        self.extra_docs = {}     # key -> fitz.Document of those
+        self._page_drag = None   # drag-to-move in progress
         self.src_path = None     # original path the person picked
         self.update_info = None
         self.plan = None
@@ -79,6 +99,10 @@ class App(_BaseTk):
         self.zoom_factor = 1.0    # 1.0 = fit the window; bigger = zoomed in
         self._layout = None       # where the sheets sit on the canvas, for zoom/pan
         self._draw_after = None
+        self._applying = False    # settings being set from a preset, not typed
+        mypresets.activate()      # this computer's own presets
+        self._ui = queue.SimpleQueue()   # work from background threads, run on the window's
+        self._sending = 0                # sends to Fiery still going
 
         self._build()
         self.bind("<Configure>", lambda e: self._schedule(150) if e.widget is self else None)
@@ -90,9 +114,12 @@ class App(_BaseTk):
                 self.dnd_bind("<<Drop>>", self._on_drop)
             except Exception:
                 self.dnd_ok = False
+        self.protocol("WM_DELETE_WINDOW", self.ask_close)
         if IS_MAC:  # Finder "Open With" and drag-onto-dock arrive as Apple events
             self.createcommand("::tk::mac::OpenDocument",
                                lambda *paths: paths and self.open_pdf(paths[0]))
+            self.createcommand("::tk::mac::Quit", self.ask_close)
+        self._poll_ui()
         if updater.should_check():
             threading.Thread(target=self._check_updates, daemon=True).start()
         if path:
@@ -132,9 +159,20 @@ class App(_BaseTk):
         panel.pack_propagate(False)
         self._build_settings(panel)
 
+        # Pages | preview, with a divider to drag (a wider Pages panel shows
+        # its thumbnails in 2, 3... columns).
+        split = self.split = ttk.Panedwindow(body, orient="horizontal")
+        split.pack(side="left", fill="both", expand=True)
+        split.add(self._build_pages(split), weight=0)
+
         # Preview (left)
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="both", expand=True)
+        left = ttk.Frame(split)
+        split.add(left, weight=1)
+        # The divider can't squeeze either side too far.
+        split.bind("<B1-Motion>", lambda e: self._clamp_split(), add="+")
+        split.bind("<ButtonRelease-1>", lambda e: self._clamp_split(), add="+")
+        self.bind("<Configure>", lambda e: self._clamp_split() if e.widget is self else None,
+                  add="+")
         view = ttk.Frame(left)
         view.pack(fill="both", expand=True)
         self.canvas = tk.Canvas(view, bg=BG, highlightthickness=0)
@@ -172,6 +210,93 @@ class App(_BaseTk):
         self.next_btn = ttk.Button(nav, text="Next >", width=8, command=lambda: self._step(1))
         self.next_btn.pack(side="left")
 
+    def _build_pages(self, parent):
+        """Pages panel: every page of the job as a thumbnail. Drag to move; cut,
+        copy, paste, duplicate, delete, blanks, other PDFs and more from the
+        right-click / Edit menu. Returns the panel's frame."""
+        box = ttk.Frame(parent, width=PAGES_W)
+        box.pack_propagate(False)
+        head = ttk.Frame(box, padding=(8, 6, 4, 4))
+        head.pack(fill="x")
+        self.pages_label = ttk.Label(head, text="Pages", style="Head.TLabel")
+        self.pages_label.pack(side="left")
+        self.page_menu = tk.Menu(self, tearoff=False, postcommand=self._page_menu_state)
+        ttk.Menubutton(head, text="Edit", menu=self.page_menu, width=5).pack(side="right")
+        mod = "Cmd" if IS_MAC else "Ctrl"
+        for label, cmd, key in (("Cut", self.page_cut, f"{mod}+X"),
+                                ("Copy", self.page_copy, f"{mod}+C"),
+                                ("Paste after", lambda: self.page_paste(after=True), f"{mod}+V"),
+                                ("Paste before", lambda: self.page_paste(after=False), ""),
+                                ("Duplicate", self.page_duplicate, f"{mod}+D"),
+                                ("Delete", self.page_delete, "Del"),
+                                (None, None, None),
+                                ("Move to start", lambda: self.page_move(0), ""),
+                                ("Move to end", lambda: self.page_move(None), ""),
+                                ("Reverse order", self.page_reverse, ""),
+                                (None, None, None),
+                                ("Insert blank page after", lambda: self.page_blank(True), ""),
+                                ("Insert blank page before", lambda: self.page_blank(False), ""),
+                                ("Blank page after every page", self.page_blank_each, ""),
+                                ("Insert pages from PDF...", self.page_insert_pdf, ""),
+                                (None, None, None),
+                                ("Save selected pages as PDF...", self.page_save_pdf, ""),
+                                (None, None, None),
+                                ("Select all", self.page_select_all, f"{mod}+A"),
+                                ("Undo", self.page_undo_last, f"{mod}+Z"),
+                                ("Back to the original pages", self.page_reset, "")):
+            if label is None:
+                self.page_menu.add_separator()
+            else:
+                self.page_menu.add_command(label=label, command=cmd, accelerator=key)
+
+        wrap = ttk.Frame(box)
+        wrap.pack(fill="both", expand=True)
+        self.pages_canvas = tk.Canvas(wrap, bg="#e4e4e4", highlightthickness=0, width=PAGES_W - 16)
+        bar = ttk.Scrollbar(wrap, orient="vertical", command=self._pages_yview)
+        self.pages_canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        self.pages_canvas.pack(side="left", fill="both", expand=True)
+        c = self.pages_canvas
+        c.bind("<Configure>", lambda e: self._draw_pages())
+        c.bind("<MouseWheel>", lambda e: self._pages_wheel(e))
+        c.bind("<ButtonPress-1>", lambda e: self._page_press(e, "one"))
+        c.bind("<Control-ButtonPress-1>", lambda e: self._page_press(e, "toggle"))
+        c.bind("<Shift-ButtonPress-1>", lambda e: self._page_press(e, "range"))
+        c.bind("<B1-Motion>", self._page_motion)
+        c.bind("<ButtonRelease-1>", self._page_release)
+        if IS_MAC:
+            c.bind("<Command-ButtonPress-1>", lambda e: self._page_press(e, "toggle"))
+            c.bind("<Button-2>", self._page_context)
+            c.bind("<Control-ButtonPress-1>", self._page_context)
+        else:
+            c.bind("<Button-3>", self._page_context)
+        # Keys work when the Pages panel has focus (click in it first), so
+        # Ctrl+C in a text box still copies text.
+        for m in ("Command",) if IS_MAC else ("Control",):
+            for key, fn in (("x", self.page_cut), ("c", self.page_copy),
+                            ("v", lambda: self.page_paste(True)), ("d", self.page_duplicate),
+                            ("a", self.page_select_all), ("z", self.page_undo_last)):
+                c.bind(f"<{m}-{key}>", lambda e, f=fn: (f(), "break")[1])
+                c.bind(f"<{m}-{key.upper()}>", lambda e, f=fn: (f(), "break")[1])
+        for key in ("Delete", "BackSpace"):
+            c.bind(f"<{key}>", lambda e: (self.page_delete(), "break")[1])
+        c.bind("<Up>", lambda e: (self._page_arrow(-self._page_cols()), "break")[1])
+        c.bind("<Down>", lambda e: (self._page_arrow(self._page_cols()), "break")[1])
+        c.bind("<Left>", lambda e: (self._page_arrow(-1), "break")[1])
+        c.bind("<Right>", lambda e: (self._page_arrow(1), "break")[1])
+        return box
+
+    def _clamp_split(self):
+        """Keep the Pages panel at least one column wide and the preview wide
+        enough for its buttons."""
+        total = self.split.winfo_width()
+        if total < 50:
+            return
+        pos = self.split.sashpos(0)
+        good = max(PAGES_W - 20, min(pos, total - PREVIEW_MIN_W))
+        if good != pos:
+            self.split.sashpos(0, good)
+
     def _row(self, parent, label, widget_fn, pady=3):
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=pady)
@@ -186,9 +311,8 @@ class App(_BaseTk):
 
     def _build_settings(self, p):
         v = self.vars = {
-            "layout": tk.StringVar(value="Gangup"),
+            "layout": tk.StringVar(value="Normal"),
             "gang": tk.StringVar(value="Repeat"),
-            "finish": tk.StringVar(value="Based on Crop Box"),
             "sheet": tk.StringVar(value="12 x 18"),
             "custom_w": tk.StringVar(value="12"),
             "custom_h": tk.StringVar(value="18"),
@@ -200,8 +324,9 @@ class App(_BaseTk):
             "gutter_y": tk.StringVar(value="0"),
             "scaling": tk.StringVar(value="Do not scale"),
             "scale_pct": tk.StringVar(value="100"),
-            "rotate": tk.StringVar(value="Upright"),
-            "head_to_head": tk.BooleanVar(value=False),
+            "turn90": tk.BooleanVar(value=False),
+            "layout_style": tk.StringVar(value="Standard"),
+            "slot_180": tk.StringVar(value="None"),
             "crop_marks": tk.StringVar(value="None"),
         }
 
@@ -213,11 +338,10 @@ class App(_BaseTk):
                                        width=24)
         self.preset_box.pack(side="left", fill="x", expand=True)
         self.preset_box.bind("<<ComboboxSelected>>", lambda e: self.apply_preset())
-        if CAN_EDIT_PRESETS:  # development copy only; staff get the shared list
-            ttk.Button(pr, text="Save...", width=7, command=self.save_preset).pack(
-                side="left", padx=(6, 0))
-            ttk.Button(pr, text="Delete", width=7, command=self.delete_preset).pack(
-                side="left", padx=(4, 0))
+        self.preset_save_btn = ttk.Button(pr, text="Save...", width=7, command=self.save_preset)
+        self.preset_save_btn.pack(side="left", padx=(6, 0))
+        self.preset_del_btn = ttk.Button(pr, text="Delete", width=7, command=self.delete_preset)
+        self.preset_del_btn.pack(side="left", padx=(4, 0))
         self._load_presets()
         # "Suggested: <preset> [Use]" when the opened file matches a preset's file size.
         self.suggest_row = ttk.Frame(p)
@@ -233,9 +357,9 @@ class App(_BaseTk):
 
         ttk.Separator(p).pack(fill="x", pady=8)
         ttk.Label(p, text="Settings", style="Head.TLabel").pack(anchor="w", pady=(0, 6))
-        self._row(p, "Layout:", self._combo(v["layout"], LAYOUTS))
-        _, self.gang_box = self._row(p, "Gangup type:", self._combo(v["gang"], GANGS))
-        self._row(p, "Finish Size:", self._combo(v["finish"], FINISHES))
+        self.layout_row, _ = self._row(p, "Layout:", self._combo(v["layout"], LAYOUTS))
+        # Gangup-only rows are hidden for Normal, like Fiery (see _sync_widgets).
+        self.gang_row, _ = self._row(p, "Gangup type:", self._combo(v["gang"], GANGS))
         self._row(p, "Sheet:", self._combo(v["sheet"], list(SHEETS) + [CUSTOM]))
 
         self.custom_row = ttk.Frame(p)
@@ -251,28 +375,29 @@ class App(_BaseTk):
 
         ttk.Separator(p).pack(fill="x", pady=8)
         ttk.Label(p, text="Layout", style="Head.TLabel").pack(anchor="w")
-        self._row(p, "Orientation:", self._combo(v["orientation"], ["Portrait", "Landscape"]))
-        pc = ttk.Frame(p)
-        pc.pack(fill="x", pady=3)
-        ttk.Label(pc, text="Pieces:", width=15).pack(side="left")
-        ttk.Combobox(pc, textvariable=v["rotate"], values=list(ROTATIONS), state="readonly",
-                     width=11).pack(side="left")
-        ttk.Checkbutton(pc, text="Head-to-head", variable=v["head_to_head"]).pack(
+        oc = ttk.Frame(p)
+        oc.pack(fill="x", pady=3)
+        ttk.Label(oc, text="Orientation:", width=15).pack(side="left")
+        ttk.Combobox(oc, textvariable=v["orientation"], values=["Portrait", "Landscape"],
+                     state="readonly", width=13).pack(side="left")
+        ttk.Checkbutton(oc, text="Turn 90\u00b0", variable=v["turn90"]).pack(
             side="left", padx=(10, 0))
+        self.slot180_row, _ = self._row(p, "180 slot rotation:",
+                                        self._combo(v["slot_180"], SLOT_180))
 
-        rc = ttk.Frame(p)
+        self.gang_box = ttk.Frame(p)   # gangup only
+        self.gang_box.pack(fill="x")
+        self._row(self.gang_box, "Layout style:", self._combo(v["layout_style"], LAYOUT_STYLES))
+        rc = ttk.Frame(self.gang_box)
         rc.pack(fill="x", pady=3)
         ttk.Label(rc, text="Rows x Columns:", width=15).pack(side="left")
         ttk.Spinbox(rc, from_=1, to=40, textvariable=v["rows"], width=4).pack(side="left")
         ttk.Label(rc, text=" x ").pack(side="left")
         ttk.Spinbox(rc, from_=1, to=40, textvariable=v["cols"], width=4).pack(side="left")
-        ttk.Button(rc, text="Fit most", command=self.fit_most).pack(side="left", padx=6)
-        self.fit_hint = ttk.Label(p, text="", style="Small.TLabel", foreground="#555")
-        self.fit_hint.pack(anchor="w", padx=(0, 0))
 
         # Gutters: two spinboxes, a Link toggle spanning both (like Illustrator's
         # chain between width and height), then Apply All / Reset.
-        g = ttk.Frame(p)
+        g = ttk.Frame(self.gang_box)
         g.pack(fill="x", pady=3)
         self.gutter_link = tk.BooleanVar(value=False)
         self._gutter_last = {"gutter_x": 0.0, "gutter_y": 0.0}
@@ -312,6 +437,9 @@ class App(_BaseTk):
 
         for var in v.values():
             var.trace_add("write", lambda *_: self._schedule())
+        v["crop_marks"].trace_add("write", lambda *_: self._bleed_gutters())
+        for key in ("custom_w", "custom_h"):
+            v[key].trace_add("write", lambda *_: self._custom_orientation())
 
     # ------------------------------------------------------------- settings
 
@@ -334,25 +462,33 @@ class App(_BaseTk):
         return Settings(
             layout=LAYOUTS[v["layout"].get()],
             gang=GANGS[v["gang"].get()],
-            finish=FINISHES[v["finish"].get()],
             sheet_w=w, sheet_h=h,
             orientation=v["orientation"].get().lower(),
-            duplex=DUPLEX[v["duplex"].get()],
+            duplex=DUPLEX[v["duplex"].get()][0],
+            back_same=DUPLEX[v["duplex"].get()][1],
             rows=num("rows", "Rows", int), cols=num("cols", "Columns", int),
             gutter_x=num("gutter_x", "Column gutter"), gutter_y=num("gutter_y", "Row gutter"),
             scaling=SCALING[v["scaling"].get()],
             scale_pct=num("scale_pct", "Scale factor"),
-            rotate=ROTATIONS[v["rotate"].get()],
-            head_to_head=v["head_to_head"].get(),
+            rotate=90 if v["turn90"].get() else 0,
+            layout_style=LAYOUT_STYLES[v["layout_style"].get()],
+            slot_180=SLOT_180[v["slot_180"].get()],
             crop_marks=CROP_MARKS[v["crop_marks"].get()],
         )
 
     def _sync_widgets(self):
         v = self.vars
-        self.gang_box.configure(state="readonly" if v["layout"].get() == "Gangup" else "disabled")
+        gangup = v["layout"].get() == "Gangup"
+        if gangup and not self.gang_row.winfo_ismapped():
+            self.gang_row.pack(fill="x", pady=3, after=self.layout_row)
+            self.gang_box.pack(fill="x", after=self.slot180_row)
+        elif not gangup:
+            self.gang_row.pack_forget()
+            self.gang_box.pack_forget()
         self.pct_box.configure(state="normal" if v["scaling"].get() == "Custom" else "disabled")
         if v["sheet"].get() == CUSTOM:
             self.custom_row.pack(in_=self.custom_anchor, fill="x", pady=3)
+            self.custom_row.lift(self.custom_anchor)   # in front of its placeholder
         else:
             self.custom_row.pack_forget()
 
@@ -373,31 +509,40 @@ class App(_BaseTk):
                 self.suggest_row.pack_forget()
 
     def reset_settings(self):
-        """Every new file starts from the defaults, with no preset selected."""
+        """Every new file starts from the defaults (Normal), with no preset selected."""
         self.preset_var.set("")
-        self._apply_settings(Settings())
+        self._apply_settings(Settings(layout="normal"))
 
     def _apply_settings(self, s):
+        self._applying = True
+        try:
+            self._apply(s)
+        finally:
+            self._applying = False
+
+    def _apply(self, s):
         v = self.vars
         sheet = next((n for n, (w, h) in SHEETS.items()
                       if sorted((w, h)) == sorted((s.sheet_w, s.sheet_h))), CUSTOM)
         pick = lambda table, val: next(k for k, x in table.items() if x == val)  # noqa: E731
         v["layout"].set(pick(LAYOUTS, s.layout))
         v["gang"].set(pick(GANGS, s.gang))
-        v["finish"].set(pick(FINISHES, s.finish))
         v["sheet"].set(sheet)
         v["custom_w"].set(f"{s.sheet_w:g}")
         v["custom_h"].set(f"{s.sheet_h:g}")
         v["orientation"].set(s.orientation.capitalize())
-        v["duplex"].set(pick(DUPLEX, s.duplex))
+        v["duplex"].set(pick(DUPLEX, (bool(s.duplex), bool(s.duplex and s.back_same))))
         v["rows"].set(str(s.rows))
         v["cols"].set(str(s.cols))
         self._set_gutter("gutter_x", s.gutter_x)
         self._set_gutter("gutter_y", s.gutter_y)
         v["scaling"].set(pick(SCALING, s.scaling))
         v["scale_pct"].set(f"{s.scale_pct:g}")
-        v["rotate"].set(pick(ROTATIONS, s.rotate if s.rotate in ROTATIONS.values() else 0))
-        v["head_to_head"].set(bool(s.head_to_head))
+        v["turn90"].set(bool(s.rotate % 180))
+        v["layout_style"].set(pick(LAYOUT_STYLES, s.layout_style if s.layout_style in
+                                   LAYOUT_STYLES.values() else "standard"))
+        v["slot_180"].set(pick(SLOT_180, s.slot_180 if s.slot_180 in SLOT_180.values()
+                               else "none"))
         v["crop_marks"].set(pick(CROP_MARKS, s.crop_marks if s.crop_marks in CROP_MARKS.values()
                                  else "none"))
 
@@ -421,15 +566,22 @@ class App(_BaseTk):
         if self.src:
             g = pull_in_gutters(self.src, s)
             s.pull_in = bool(g) and abs(g[0] - s.gutter_x) < 0.005 and abs(g[1] - s.gutter_y) < 0.005
-        save_preset(name, s, match_size=self._file_size(), match_cut=self._cut_size())
+        try:
+            save_preset(name, s, match_size=self._file_size(), match_cut=self._cut_size())
+        except OSError as e:
+            messagebox.showerror("Couldn't save the preset", str(e), parent=self)
+            return
         self._load_presets(select=name)
 
     def delete_preset(self):
         name = self.preset_var.get()
         if not name:
             return
-        if messagebox.askyesno("Delete preset?", f"Delete the preset '{name}'?"):
-            delete_preset(name)
+        if messagebox.askyesno("Delete preset?", f"Delete the preset '{name}'?", parent=self):
+            try:
+                delete_preset(name)
+            except OSError as e:
+                messagebox.showerror("Couldn't delete the preset", str(e), parent=self)
             self._load_presets()
 
     def _file_size(self):
@@ -453,6 +605,7 @@ class App(_BaseTk):
         if self._suggested and self.preset_var.get() != self._suggested:
             self.suggest_label.configure(text=f"Suggested for this file: {self._suggested}")
             self.suggest_row.pack(in_=self.suggest_anchor, fill="x", pady=(4, 0))
+            self.suggest_row.lift(self.suggest_anchor)
         else:
             self.suggest_row.pack_forget()
 
@@ -465,12 +618,14 @@ class App(_BaseTk):
     def _bind_shortcuts(self):
         mods = ("Control", "Command") if IS_MAC else ("Control",)
         for mod in mods:
-            self.bind_all(f"<{mod}-o>", lambda e: (self.choose_pdf(), "break")[1])
-            self.bind_all(f"<{mod}-O>", lambda e: (self.choose_pdf(), "break")[1])
-            self.bind_all(f"<{mod}-s>", lambda e: (self.save(), "break")[1])
-            self.bind_all(f"<{mod}-S>", lambda e: (self.save(), "break")[1])
-        self.bind_all("<Prior>", lambda e: self._step(-1))   # Page Up
-        self.bind_all("<Next>", lambda e: self._step(1))     # Page Down
+            # On the main window only (not bind_all): in the Send window,
+            # Ctrl+S mustn't save again behind it.
+            self.bind(f"<{mod}-o>", lambda e: (self.choose_pdf(), "break")[1])
+            self.bind(f"<{mod}-O>", lambda e: (self.choose_pdf(), "break")[1])
+            self.bind(f"<{mod}-s>", lambda e: (self.save(), "break")[1])
+            self.bind(f"<{mod}-S>", lambda e: (self.save(), "break")[1])
+        self.bind("<Prior>", lambda e: self._step(-1))   # Page Up
+        self.bind("<Next>", lambda e: self._step(1))     # Page Down
 
     def _on_drop(self, event):
         paths = [Path(p) for p in self.tk.splitlist(event.data)]
@@ -538,28 +693,392 @@ class App(_BaseTk):
         try:
             # Read the whole file into memory: the original is never written to
             # or held open (so OneDrive can keep syncing it).
-            doc = fitz.open(stream=path.read_bytes(), filetype="pdf")
+            raw = path.read_bytes()
+            doc = fitz.open(stream=raw, filetype="pdf")
             if doc.page_count == 0:
                 raise ValueError("The PDF has no pages.")
         except Exception as e:  # show it, don't crash the window
             messagebox.showerror("Couldn't open", f"{path.name}\n\n{e}")
             return
-        if self.src is not None:
+        if self.src is not None and self.src is not self.original:
             self.src.close()
+        if self.original is not None:
+            self.original.close()
+        self.original, self.original_bytes = doc, raw
         self.src, self.src_path = doc, path
+        self.page_tokens = pages.original(doc.page_count)
+        self.page_sel, self.page_undo, self.page_clip = [], [], []
+        self._thumbs = {}
+        self.extras, self.extra_docs = {}, {}
+        self.pages_canvas.yview_moveto(0)
         self._preview_cache = {}
         self.sheet_index = 0
         self.zoom_factor = 1.0
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
         self.reset_settings()
 
+        self._file_note()
+        self._update_suggestion()
+        self._draw_pages()
+        self._refresh()
+
+    def _file_note(self):
+        doc, path = self.src, self.src_path
         fin = finish_rect(doc[0], "crop")
         note = f'{path.name}  |  {doc.page_count} page(s), {fin.width / PT:.3f}" x {fin.height / PT:.3f}"'
         if has_bleed(doc[0]):
             trim = finish_rect(doc[0], "trim")
             note += f'  |  cuts to {trim.width / PT:.3f}" x {trim.height / PT:.3f}" (bleed built in)'
+        if not pages.is_original(self.page_tokens, self.original.page_count):
+            note += "  |  pages edited (the original file is unchanged)"
         self.file_label.configure(text=note)
-        self._update_suggestion()
+
+    # ---------------------------------------------------------------- pages
+
+    def _set_pages(self, tokens, sel):
+        """A new page list: keep the old one for Undo, rebuild what's imposed."""
+        self.page_undo.append((self.page_tokens, self.page_sel))
+        del self.page_undo[:-50]
+        self._use_pages(tokens, sel)
+
+    def _use_pages(self, tokens, sel):
+        old = self.src
+        self.page_tokens, self.page_sel = list(tokens), list(sel)
+        if pages.is_original(self.page_tokens, self.original.page_count):
+            self.src = self.original
+        else:
+            self.src = pages.build(self.original_bytes, self.page_tokens, self.extras)
+        if old is not None and old is not self.original and old is not self.src:
+            old.close()
+        self._preview_cache = {}
+        self._file_note()
+        self._draw_pages()
         self._refresh()
+
+    def _page_menu_state(self):
+        has_file = bool(self.src)
+        sel = bool(self.page_sel) and has_file
+        states = {"Cut": sel, "Copy": sel, "Paste after": bool(self.page_clip) and has_file,
+                  "Paste before": bool(self.page_clip) and has_file, "Duplicate": sel,
+                  "Insert blank page after": has_file, "Insert blank page before": has_file,
+                  "Delete": sel, "Select all": has_file, "Undo": bool(self.page_undo),
+                  "Move to start": sel, "Move to end": sel, "Reverse order": has_file,
+                  "Blank page after every page": has_file,
+                  "Insert pages from PDF...": has_file,
+                  "Save selected pages as PDF...": has_file,
+                  "Back to the original pages": has_file and not pages.is_original(
+                      self.page_tokens, self.original.page_count)}
+        for label, on in states.items():
+            self.page_menu.entryconfigure(label, state="normal" if on else "disabled")
+
+    def _page_context(self, e):
+        i = self._page_at(e.x, e.y)
+        if i is not None and i not in self.page_sel:
+            self.page_sel = [i]
+            self._draw_pages()
+        self.pages_canvas.focus_set()
+        self._page_menu_state()
+        self.page_menu.tk_popup(e.x_root, e.y_root)
+        return "break"
+
+    def page_copy(self):
+        if self.src and self.page_sel:
+            self.page_clip = pages.copy(self.page_tokens, self.page_sel)
+
+    def page_cut(self):
+        if self.src and self.page_sel:
+            clip = pages.copy(self.page_tokens, self.page_sel)
+            if self.page_delete():
+                self.page_clip = clip
+
+    def page_paste(self, after=True):
+        if not self.src or not self.page_clip:
+            return
+        sel = sorted(self.page_sel)
+        at = (sel[-1] + 1 if after else sel[0]) if sel else len(self.page_tokens)
+        self._set_pages(*pages.insert(self.page_tokens, at, self.page_clip))
+
+    def page_delete(self):
+        if not self.src or not self.page_sel:
+            return False
+        try:
+            self._set_pages(*pages.delete(self.page_tokens, self.page_sel))
+        except ValueError as e:
+            messagebox.showinfo("Can't delete", str(e), parent=self)
+            return False
+        return True
+
+    def page_duplicate(self):
+        if self.src and self.page_sel:
+            self._set_pages(*pages.duplicate(self.page_tokens, self.page_sel))
+
+    def page_blank(self, after=True):
+        if not self.src:
+            return
+        sel = sorted(self.page_sel) or [len(self.page_tokens) - 1]
+        ref = self.page_tokens[sel[-1] if after else sel[0]]
+        at = sel[-1] + 1 if after else sel[0]
+        self._set_pages(*pages.insert(self.page_tokens, at, [self._blank_for(ref)]))
+
+    def _blank_for(self, token):
+        return pages.blank_like(self.original, token, self.extra_docs)
+
+    def page_move(self, to):
+        """Move the selection to the start (0) or the end (None)."""
+        if self.src and self.page_sel:
+            to = len(self.page_tokens) if to is None else to
+            self._set_pages(*pages.move(self.page_tokens, self.page_sel, to))
+
+    def page_reverse(self):
+        """Reverse the selected pages, or all of them if one or none is selected."""
+        if self.src:
+            self._set_pages(*pages.reverse(self.page_tokens, self.page_sel))
+
+    def page_blank_each(self):
+        """A blank page after every page: one-sided pages, printed duplex."""
+        if self.src:
+            self._set_pages(*pages.blank_after_each(self.page_tokens, self._blank_for))
+
+    def page_insert_pdf(self):
+        """Put the pages of another PDF in after the selection (or at the end)."""
+        if not self.src:
+            return
+        path = filedialog.askopenfilename(parent=self, title="Insert pages from a PDF",
+                                          initialdir=str(self.src_path.parent),
+                                          filetypes=[("PDF files", "*.pdf")])
+        if not path:
+            return
+        try:
+            raw = Path(path).read_bytes()
+            doc = fitz.open(stream=raw, filetype="pdf")
+            if doc.page_count == 0:
+                raise ValueError("The PDF has no pages.")
+        except Exception as e:
+            messagebox.showerror("Couldn't open", f"{Path(path).name}\n\n{e}", parent=self)
+            return
+        key = max(self.extras, default=0) + 1
+        self.extras[key], self.extra_docs[key] = raw, doc
+        sel = sorted(self.page_sel)
+        at = sel[-1] + 1 if sel else len(self.page_tokens)
+        self._set_pages(*pages.insert(self.page_tokens, at,
+                                      [("ext", key, i) for i in range(doc.page_count)]))
+
+    def page_save_pdf(self):
+        """Save the selected pages (or all of them) as their own PDF."""
+        if not self.src:
+            return
+        picked = sorted(self.page_sel) or list(range(len(self.page_tokens)))
+        nums = (f"page {picked[0] + 1}" if len(picked) == 1
+                else f"pages {picked[0] + 1}-{picked[-1] + 1}"
+                if picked == list(range(picked[0], picked[-1] + 1)) else "pages")
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Save pages as a PDF", defaultextension=".pdf",
+            initialdir=str(self.src_path.parent),
+            initialfile=f"{self.src_path.stem} - {nums}.pdf", filetypes=[("PDF files", "*.pdf")])
+        if not path:
+            return
+        try:
+            doc = pages.build(self.original_bytes, [self.page_tokens[i] for i in picked],
+                              self.extras)
+            doc.save(path, garbage=4, deflate=True)
+            doc.close()
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e), parent=self)
+            return
+        reveal(path)
+
+    def page_select_all(self):
+        if self.src:
+            self.page_sel = list(range(len(self.page_tokens)))
+            self._draw_pages()
+
+    def page_undo_last(self):
+        if self.src and self.page_undo:
+            self._use_pages(*self.page_undo.pop())
+
+    def page_reset(self):
+        if self.src and not pages.is_original(self.page_tokens, self.original.page_count):
+            self._set_pages(pages.original(self.original.page_count), [])
+
+    # thumbnails
+
+    def _page_cols(self):
+        cw = max(self.pages_canvas.winfo_width(), 60)
+        return max(1, int((cw - 12 + THUMB_COL_GAP) // (THUMB_W + THUMB_COL_GAP)))
+
+    def _thumb_layout(self):
+        """[(x0, y0, w, h)] of each page's thumbnail in the panel, and the total
+        height. As many columns as fit; each row as tall as its tallest page."""
+        cols = self._page_cols()
+        cw = max(self.pages_canvas.winfo_width(), 60)
+        left = (cw - (cols * THUMB_W + (cols - 1) * THUMB_COL_GAP)) / 2
+        out, y = [], 10
+        sizes = [pages.size_of(t, self.original, self.extra_docs) for t in self.page_tokens]
+        for row in range(0, len(sizes), cols):
+            row_h = 0
+            for j, (pw, ph) in enumerate(sizes[row:row + cols]):
+                k = min(THUMB_W / pw, THUMB_H / ph)
+                w, h = pw * k, ph * k
+                cx = left + j * (THUMB_W + THUMB_COL_GAP) + THUMB_W / 2
+                out.append((cx - w / 2, y, w, h))
+                row_h = max(row_h, h)
+            y += row_h + THUMB_GAP
+        return out, y
+
+    def _thumb(self, token, w, h):
+        key = (token, round(w))
+        img = self._thumbs.get(key)
+        if img is None and token[0] != "blank":
+            page = pages.page_of(token, self.original, self.extra_docs)
+            z = w / page.rect.width
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+            img = tk.PhotoImage(data=pix.tobytes("ppm"))
+            self._thumbs[key] = img
+        return img
+
+    def _draw_pages(self):
+        c = self.pages_canvas
+        c.delete("all")
+        if not self.src:
+            self.pages_label.configure(text="Pages")
+            return
+        boxes, total = self._thumb_layout()
+        sizes = [pages.size_of(t, self.original, self.extra_docs) for t in self.page_tokens]
+        odd = set(pages.odd_sizes(sizes))
+        self.pages_label.configure(text=f"Pages ({len(self.page_tokens)})")
+        c.configure(scrollregion=(0, 0, max(c.winfo_width(), 60), total))
+        top, bottom = c.canvasy(0), c.canvasy(c.winfo_height())
+        sel = set(self.page_sel)
+        for i, (t, (x, y, w, h)) in enumerate(zip(self.page_tokens, boxes)):
+            if i in sel:
+                c.create_rectangle(x - 5, y - 5, x + w + 5, y + h + 20, fill="#cfe0f7",
+                                   outline="#3b78d8", width=2)
+            c.create_rectangle(x + 2, y + 2, x + w + 2, y + h + 2, fill="#a8a8a8", outline="")
+            c.create_rectangle(x, y, x + w, y + h, fill="white", outline="#bbb")
+            if y + h >= top and y <= bottom:   # only render what's on screen
+                img = self._thumb(t, w, h)
+                if img is not None:
+                    c.create_image(x, y, image=img, anchor="nw")
+            if i in odd:   # not the size of the rest
+                c.create_rectangle(x - 1, y - 1, x + w + 1, y + h + 1, outline=FLAG, width=3)
+                pw, ph = (v / PT for v in sizes[i])
+                c.create_text(x + w / 2, y + h + 10, text=f'{i + 1}   {pw:g}" x {ph:g}"',
+                              font=(UI_FONT, 9, "bold"), fill=FLAG)
+            else:
+                c.create_text(x + w / 2, y + h + 10, text=str(i + 1), font=(UI_FONT, 9))
+        drag = self._page_drag
+        if drag and drag.get("at") is not None:   # where a dragged page would land
+            at = drag["at"]
+            if at < len(boxes):
+                x, y, w, h = boxes[at]
+                lx = x - THUMB_COL_GAP / 2 + 2
+            else:
+                x, y, w, h = boxes[-1]
+                lx = x + w + THUMB_COL_GAP / 2 - 2
+            c.create_line(lx, y - 6, lx, y + h + 6, fill="#3b78d8", width=4)
+
+    def _pages_yview(self, *args):
+        self.pages_canvas.yview(*args)
+        self._draw_pages()
+
+    def _pages_wheel(self, e):
+        self.pages_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        self._draw_pages()
+
+    def _page_at(self, x, y):
+        """The page under a point in the panel, or None."""
+        cx, cy = self.pages_canvas.canvasx(x), self.pages_canvas.canvasy(y)
+        boxes, _ = self._thumb_layout()
+        for i, (bx, by, bw, bh) in enumerate(boxes):
+            if bx - 8 <= cx <= bx + bw + 8 and by - 6 <= cy <= by + bh + THUMB_GAP - 6:
+                return i
+        return None
+
+    def _drop_at(self, x, y):
+        """Where a dragged page would go: the gap nearest the pointer (0..len)."""
+        cx, cy = self.pages_canvas.canvasx(x), self.pages_canvas.canvasy(y)
+        boxes, _ = self._thumb_layout()
+        best, at = None, len(boxes)
+        for i, (bx, by, bw, bh) in enumerate(boxes):
+            if by - THUMB_GAP / 2 <= cy <= by + bh + THUMB_GAP / 2:
+                for pos, gx in ((i, bx), (i + 1, bx + bw)):
+                    d = abs(cx - gx)
+                    if best is None or d < best:
+                        best, at = d, pos
+        return at
+
+    def _page_press(self, e, how):
+        self.pages_canvas.focus_set()
+        if not self.src:
+            return "break"
+        i = self._page_at(e.x, e.y)
+        self._page_drag = {"start": (e.x, e.y), "i": i, "how": how, "moved": False, "at": None}
+        if i is None:
+            self.page_sel = []
+        elif how == "toggle":
+            self.page_sel = sorted(set(self.page_sel) ^ {i})
+        elif how == "range" and self.page_sel:
+            a = self.page_sel[-1]
+            self.page_sel = sorted(set(self.page_sel) | set(range(min(a, i), max(a, i) + 1)))
+        elif i not in self.page_sel:
+            self.page_sel = [i]
+        self._draw_pages()
+        return "break"
+
+    def _page_motion(self, e):
+        drag = self._page_drag
+        if not drag or drag["i"] is None or drag["how"] != "one" or not self.page_sel:
+            return
+        sx, sy = drag["start"]
+        if not drag["moved"] and abs(e.x - sx) < 6 and abs(e.y - sy) < 6:
+            return
+        drag["moved"] = True
+        c = self.pages_canvas
+        if e.y < 20:             # near the top or bottom edge: scroll
+            c.yview_scroll(-1, "units")
+        elif e.y > c.winfo_height() - 20:
+            c.yview_scroll(1, "units")
+        drag["at"] = self._drop_at(e.x, e.y)
+        self._draw_pages()
+
+    def _page_release(self, e):
+        drag, self._page_drag = self._page_drag, None
+        if not drag or not self.src:
+            return
+        if drag["moved"] and drag["at"] is not None:
+            self._set_pages(*pages.move(self.page_tokens, self.page_sel, drag["at"]))
+            return
+        i = drag["i"]
+        if i is not None and drag["how"] == "one":
+            self.page_sel = [i]     # a plain click on one of several selected
+            self._draw_pages()
+            self._show_page(i)
+        elif i is not None:
+            self._show_page(i)
+
+    def _page_arrow(self, d):
+        if not self.src:
+            return
+        i = (self.page_sel[-1] + d) if self.page_sel else 0
+        i = max(0, min(len(self.page_tokens) - 1, i))
+        self.page_sel = [i]
+        boxes, total = self._thumb_layout()
+        y = boxes[i][1]
+        c = self.pages_canvas
+        if y < c.canvasy(0) or y + boxes[i][3] > c.canvasy(c.winfo_height()):
+            c.yview_moveto(max(0.0, (y - 10) / total))
+        self._draw_pages()
+        self._show_page(i)
+
+    def _show_page(self, i):
+        """Scroll the preview to the sheet this page prints on."""
+        if not self.plan:
+            return
+        for k, (front, back) in enumerate(self.plan.sides):
+            if any(pl.pno == i for pl in (front or []) + (back or [])):
+                self.show_sheet(k)
+                return
 
     def save(self):
         """
@@ -574,17 +1093,22 @@ class App(_BaseTk):
             reveal(dest)
             self._notes([("ok", f"Saved: {dest.name}\nin {dest.parent}")])
 
-    def _imposed_path(self):
+    def _imposed_path(self, name=None):
+        """Next to the original: "<name> - imposed 12x18 7x3.pdf". The name is
+        the job name when sending, else the original's."""
         s = self.plan.settings
         w, h = s.sheet_size()
-        return self.src_path.parent / f"{self.src_path.stem} - imposed {w:g}x{h:g} {s.rows}x{s.cols}.pdf"
+        stem = "".join("-" if c in '\\/:*?"<>|' else c for c in (name or "")).strip(" .")
+        stem = stem or self.src_path.stem
+        return self.src_path.parent / f"{stem} - imposed {w:g}x{h:g} {s.rows}x{s.cols}.pdf"
 
-    def _write_imposed(self, ask_replace=True):
+    def _write_imposed(self, ask_replace=True, name=None, parent=None):
         """Write the imposed PDF next to the original. Returns its path, or None."""
-        dest = self._imposed_path()
+        dest = self._imposed_path(name)
         name = dest.name
         if ask_replace and dest.exists() and not messagebox.askyesno(
-                "Replace?", f"{name} already exists in\n{dest.parent}\n\nReplace it?"):
+                "Replace?", f"{name} already exists in\n{dest.parent}\n\nReplace it?",
+                parent=parent or self):
             return None
         part = dest.with_name(dest.name + ".part")
         try:
@@ -594,7 +1118,7 @@ class App(_BaseTk):
             os.replace(part, dest)  # a half-written file never takes the real name
         except Exception as e:
             part.unlink(missing_ok=True)
-            messagebox.showerror("Save failed", f"{name}\n\n{e}")
+            messagebox.showerror("Save failed", f"{name}\n\n{e}", parent=parent or self)
             return None
         return dest
 
@@ -679,11 +1203,12 @@ class App(_BaseTk):
             paper = next(pp for pp in papers if pp.name == paper_var.get())
             copies, label = fiery.copies_for(plan_, int(qty_var.get()))
             job = name_var.get().strip() or self.src_path.stem
-            dest = self._write_imposed()
+            dest = self._write_imposed(name=job, parent=win)
             if not dest:
                 return
             send_btn.configure(state="disabled")
             status.configure(text=f"Sending to {pr.name}...", foreground="")
+            self._sending += 1
             pdf = dest.read_bytes()
             args = dict(press=pr, queue=paper.queue_for(pr), pdf=pdf, job_name=job,
                         copies=copies, sides=fiery.sides_for(plan_), sheet_pt=plan_.sheet,
@@ -692,14 +1217,15 @@ class App(_BaseTk):
             def work():
                 try:
                     job_id = fiery.send(**args)
-                    self.after(0, lambda: done(pr, job, job_id, label, dest))
+                    self._call_soon(lambda: done(pr, job, job_id, label, dest))
                 except fiery.SendError as e:
                     msg = str(e)
-                    self.after(0, lambda: failed(msg))
+                    self._call_soon(lambda: failed(msg))
 
             threading.Thread(target=work, daemon=True).start()
 
         def done(pr, job, job_id, label, dest):
+            self._sending -= 1
             if win.winfo_exists():
                 win.destroy()
             jid = f" as job {job_id}" if job_id else ""
@@ -709,12 +1235,14 @@ class App(_BaseTk):
             messagebox.showinfo("Sent to Fiery", text, parent=self)
 
         def failed(msg):
+            self._sending -= 1
             if win.winfo_exists():
                 status.configure(text=msg, foreground="#b00")
                 send_btn.configure(state="normal")
 
         send_btn.configure(command=do_send)
         win.bind("<Escape>", lambda e: win.destroy())
+        self._centre(win)
         win.grab_set()
 
     # -------------------------------------------------------------- updates
@@ -722,7 +1250,7 @@ class App(_BaseTk):
     def _check_updates(self):
         info = updater.check()  # background thread: network only, no Tk calls
         if info:
-            self.after(0, lambda: self._offer_update(info))
+            self._call_soon(lambda: self._offer_update(info))
 
     def _offer_update(self, info):
         self.update_info = info
@@ -759,15 +1287,15 @@ class App(_BaseTk):
         now.pack(side="right", padx=(0, 8))
 
         def progress(f):
-            self.after(0, lambda: bar.configure(value=f))
+            self._call_soon(lambda: bar.configure(value=f) if bar.winfo_exists() else None)
 
         def work():
             try:
                 path = updater.download(info, progress)
             except Exception as e:
-                self.after(0, lambda: failed(e))
+                self._call_soon(lambda: failed(e))
                 return
-            self.after(0, lambda: finish(path))
+            self._call_soon(lambda: finish(path))
 
         def failed(e):
             status.configure(text=f"Couldn't update: {e}")
@@ -791,39 +1319,116 @@ class App(_BaseTk):
             threading.Thread(target=work, daemon=True).start()
 
         now.configure(command=start)
+        self._centre(win)
         win.grab_set()
+
+    def _call_soon(self, fn):
+        """From a background thread: run fn on the window's own thread (Tk
+        mustn't be touched from other threads)."""
+        self._ui.put(fn)
+
+    def _poll_ui(self):
+        while True:
+            try:
+                fn = self._ui.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except tk.TclError:   # its window was closed meanwhile
+                pass
+        self.after(80, self._poll_ui)
+
+    def _centre(self, win):
+        """Put a dialog in the middle of the app window (not the screen corner)."""
+        win.withdraw()
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = self.winfo_rootx() + (self.winfo_width() - w) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - h) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.deiconify()
+
+    def ask_close(self):
+        """
+        Closing with a file open asks first, with Send to Fiery as the obvious
+        next step (closing out of habit before sending was easy to do).
+        """
+        if self._sending:
+            messagebox.showinfo("Still sending", "A job is still on its way to the Fiery. "
+                                "Close once it's sent (a message says so).", parent=self)
+            return
+        if not self.src:
+            self.destroy()
+            return
+        win = tk.Toplevel(self)
+        win.title("Close Prestige Impose?")
+        win.transient(self)
+        win.resizable(False, False)
+        f = ttk.Frame(win, padding=16)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Are you sure you would like to close this?",
+                  style="Head.TLabel").pack(anchor="w")
+        ttk.Label(f, text=self.src_path.name, style="Small.TLabel").pack(anchor="w", pady=(2, 0))
+        btns = ttk.Frame(f)
+        btns.pack(anchor="e", pady=(14, 0))
+
+        def send():
+            win.destroy()
+            self.send_to_fiery()
+
+        can_send = bool(self.plan and not self.plan.errors)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right", padx=(0, 6))
+        first = ttk.Button(btns, text="Send to Fiery...", command=send,
+                           state="normal" if can_send else "disabled")
+        first.pack(side="right", padx=(0, 6))
+        win.bind("<Escape>", lambda e: win.destroy())
+        self._centre(win)
+        win.grab_set()
+        (first if can_send else btns.winfo_children()[0]).focus_set()
 
     # ------------------------------------------------------------ actions
 
-    def fit_most(self):
-        """
-        Most pieces on the sheet, the way the shop does it: pull in until only a
-        sliver of the file's own crop marks shows (or the cut lines meet, if it
-        has none), and try the pieces turned.
-        """
-        if not self.src:
+    def _custom_orientation(self):
+        """A custom size typed wide (19 x 13) means landscape, tall means portrait."""
+        if self._applying:
             return
         try:
-            s = self.settings()
-        except ValueError as e:
-            messagebox.showerror("Check the settings", str(e))
+            w, h = float(self.vars["custom_w"].get()), float(self.vars["custom_h"].get())
+        except ValueError:
             return
-        best = best_fit(self.src, s)
-        if not best:
-            messagebox.showinfo("Doesn't fit", "Not even one piece fits on this sheet.")
+        if w != h:
+            self.vars["orientation"].set("Landscape" if w > h else "Portrait")
+
+    def _bleed_gutters(self):
+        """Crop marks with bleed need the pieces 0.25" apart; open them up to that."""
+        if CROP_MARKS.get(self.vars["crop_marks"].get()) not in ("stretch", "enlarge"):
             return
-        r, c, rot, gx, gy = best
-        self.vars["rotate"].set(next(k for k, v in ROTATIONS.items() if v == rot))
-        self._set_gutter("gutter_x", gx)
-        self._set_gutter("gutter_y", gy)
-        self.vars["rows"].set(str(r))
-        self.vars["cols"].set(str(c))
-        self._schedule()
+        for key in ("gutter_x", "gutter_y"):
+            try:
+                g = float(self.vars[key].get())
+            except ValueError:
+                g = 0.0
+            if g < 2 * BLEED_IN:
+                self._set_gutter(key, 2 * BLEED_IN)
 
     def _step(self, d):
         if self.plan:
-            self.sheet_index = max(0, min(self.plan.sheet_count - 1, self.sheet_index + d))
-            self._refresh()
+            self.show_sheet(self.sheet_index + d)
+
+    def show_sheet(self, k):
+        """Scroll so sheet k (front and back) is at the top of the preview."""
+        lay = self._layout
+        if not lay:
+            return
+        k = max(0, min(lay["count"] - 1, k))
+        self.sheet_index = k
+        ox, oy = self._unit_origin(k)
+        rw, rh = lay["region"]
+        self.canvas.xview_moveto(max(0.0, (ox - PREVIEW_PAD) / rw))
+        self.canvas.yview_moveto(max(0.0, (oy - PREVIEW_PAD) / rh))
+        self._draw_preview()
 
     # --------------------------------------------------------------- preview
 
@@ -869,19 +1474,6 @@ class App(_BaseTk):
         self.plan = p = plan(self.src, s)
         self.sheet_index = min(self.sheet_index, max(0, p.sheet_count - 1))
 
-        # Hint: how many fit, pieces upright and turned, pulled in the way Fit most does.
-        fin = finish_rect(self.src[0], s.finish)
-        k = s.scale_pct / 100 if s.scaling == "custom" else 1.0
-        hints = []
-        for rot, label in ((0, "upright"), (90, "turned")):
-            s2 = Settings(**{**s.__dict__, "rotate": rot})
-            pull = pull_in_gutters(self.src, s2)
-            if pull:
-                s2.gutter_x, s2.gutter_y = pull
-            r, c = most_that_fit(s2, fin.width, fin.height, k, outer_spare(self.src, s2))
-            hints.append(f"{label} {r} x {c} = {r * c}")
-        self.fit_hint.configure(text="Most that fit: " + ",  ".join(hints))
-
         lines = [("", describe(p, self.src.page_count))]
         lines += [("err", "ERROR: " + e) for e in p.errors]
         lines += [("warn", "Check: " + w) for w in p.warnings]
@@ -902,11 +1494,11 @@ class App(_BaseTk):
         mods = ("Control", "Command") if IS_MAC else ("Control",)
         for mod in mods:
             for key in ("plus", "equal", "KP_Add"):
-                self.bind_all(f"<{mod}-{key}>", lambda e: self._zoom_key(ZOOM_STEP))
+                self.bind(f"<{mod}-{key}>", lambda e: self._zoom_key(ZOOM_STEP))
             for key in ("minus", "underscore", "KP_Subtract"):
-                self.bind_all(f"<{mod}-{key}>", lambda e: self._zoom_key(1 / ZOOM_STEP))
+                self.bind(f"<{mod}-{key}>", lambda e: self._zoom_key(1 / ZOOM_STEP))
             for key in ("0", "KP_0"):
-                self.bind_all(f"<{mod}-{key}>", lambda e: self.zoom_fit())
+                self.bind(f"<{mod}-{key}>", lambda e: self.zoom_fit())
 
     def _zoom_key(self, mult):
         # Zoom toward the mouse if it's over the preview, else the middle.
@@ -939,19 +1531,35 @@ class App(_BaseTk):
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
         mx, my = at if at else (cw / 2, ch / 2)
         # The sheet point under the pointer, so it stays under the pointer.
-        cx, cy = self.canvas.canvasx(mx), self.canvas.canvasy(my)
-        z = lay["zpx"]
-        step = lay["w_px"] + PREVIEW_GAP
-        i = min(max(int((cx - lay["x0"]) // step), 0), lay["n"] - 1)
-        u = ((cx - (lay["x0"] + i * step)) / z, (cy - lay["y0"]) / z)
         self.zoom_factor = new
-        self._draw_preview(anchor=(i, u, mx, my))
+        self._draw_preview(anchor=(*self._point_at(mx, my), mx, my))
+
+    def _point_at(self, mx, my):
+        """(sheet, side, (x, y) points on that side) under a view point."""
+        lay = self._layout
+        cx, cy = self.canvas.canvasx(mx), self.canvas.canvasy(my)
+        uw, uh = lay["unit"]
+        col = min(max(int((cx - lay["x0"]) // (uw + SHEET_GAP)), 0), lay["cols"] - 1)
+        row = max(int((cy - lay["y0"]) // (uh + SHEET_GAP)), 0)
+        k = min(row * lay["cols"] + col, lay["count"] - 1)
+        ox, oy = self._unit_origin(k)
+        step = lay["w_px"] + PREVIEW_GAP
+        i = min(max(int((cx - ox) // step), 0), lay["n"] - 1)
+        z = lay["zpx"]
+        return k, i, ((cx - ox - i * step) / z, (cy - oy) / z)
+
+    def _unit_origin(self, k, lay=None):
+        """Canvas top-left of sheet k (its front; the back sits to its right)."""
+        lay = lay or self._layout
+        uw, uh = lay["unit"]
+        return (lay["x0"] + (k % lay["cols"]) * (uw + SHEET_GAP),
+                lay["y0"] + (k // lay["cols"]) * (uh + SHEET_GAP))
 
     def zoom_fit(self):
+        """One sheet (front and back) fills the view; the current one."""
         self.zoom_factor = 1.0
-        self.canvas.xview_moveto(0)
-        self.canvas.yview_moveto(0)
         self._draw_preview()
+        self.show_sheet(self.sheet_index)
         return "break"
 
     def _xview(self, *args):
@@ -969,7 +1577,6 @@ class App(_BaseTk):
 
     def _drag(self, e):
         self.canvas.scan_dragto(e.x, e.y, gain=1)
-        self._schedule_draw(15)
 
     def _schedule_draw(self, ms=30):
         if self._draw_after:
@@ -978,9 +1585,11 @@ class App(_BaseTk):
 
     def _draw_preview(self, anchor=None):
         """
-        Draw the current sheet at the current zoom. Only the part on screen is
-        rendered, so zooming in costs no more than the fitted view. `anchor`
-        keeps a sheet point under the pointer while zooming.
+        Draw every sheet (front and back side by side) in a grid that scrolls,
+        like Fiery: at Fit one sheet fills the view, zoom out and more fit
+        across. Only the sheets on screen are rendered, so a long job costs no
+        more than a short one. `anchor` keeps a sheet point under the pointer
+        while zooming.
         """
         self._draw_after = None
         p = self.plan
@@ -989,58 +1598,80 @@ class App(_BaseTk):
         self.canvas.delete("all")
         self._images.clear()
         cw, ch = max(self.canvas.winfo_width(), 200), max(self.canvas.winfo_height(), 200)
-        n = sum(1 for side in p.sides[self.sheet_index] if side is not None)
-        labels = ["Front", "Back"] if n == 2 else ["Front"]
+        count = p.sheet_count
+        n = 2 if any(b is not None for _, b in p.sides) else 1
+        labels = ["Front", "Back"][:n]
         sw, sh = p.sheet
         g, pad, lab = PREVIEW_GAP, PREVIEW_PAD, PREVIEW_LABEL_H
         fit = self._fit_zoom(n, sw, sh)
         zpx = fit * self.zoom_factor
         w_px, h_px = sw * zpx, sh * zpx
-        content_w = n * w_px + (n - 1) * g + 2 * pad
-        content_h = h_px + lab + 2 * pad
-        region_w, region_h = max(cw, content_w), max(ch, content_h)
-        x0 = (region_w - (n * w_px + (n - 1) * g)) / 2
-        y0 = (region_h - lab - h_px) / 2
+        uw, uh = n * w_px + (n - 1) * g, h_px + lab
+        cols = max(1, min(count, int((cw - 2 * pad + SHEET_GAP) // (uw + SHEET_GAP))))
+        rows = -(-count // cols)
+        grid_w = cols * uw + (cols - 1) * SHEET_GAP
+        grid_h = rows * uh + (rows - 1) * SHEET_GAP
+        region_w, region_h = max(cw, grid_w + 2 * pad), max(ch, grid_h + 2 * pad)
+        x0 = (region_w - grid_w) / 2
+        y0 = (region_h - grid_h) / 2
         self.canvas.configure(scrollregion=(0, 0, region_w, region_h))
-        self._layout = {"fit": fit, "zpx": zpx, "w_px": w_px, "x0": x0, "y0": y0, "n": n}
+        lay = self._layout = {"fit": fit, "zpx": zpx, "w_px": w_px, "x0": x0, "y0": y0,
+                              "n": n, "cols": cols, "count": count, "unit": (uw, uh),
+                              "region": (region_w, region_h)}
         self.zoom_label.configure(text=f"{self._pct(zpx):.0f}%")
 
         if anchor:  # put the anchored sheet point back under the pointer
-            i, (ux, uy), mx, my = anchor
-            ax = x0 + i * (w_px + g) + ux * zpx
-            ay = y0 + uy * zpx
+            k, i, (ux, uy), mx, my = anchor
+            ox, oy = self._unit_origin(k, lay)
+            ax = ox + i * (w_px + g) + ux * zpx
+            ay = oy + uy * zpx
             self.canvas.xview_moveto(max(0.0, (ax - mx) / region_w))
             self.canvas.yview_moveto(max(0.0, (ay - my) / region_h))
 
         vx0, vy0 = self.canvas.canvasx(0), self.canvas.canvasy(0)
-        views = []
-        for i in range(n):
-            ox = x0 + i * (w_px + g)
-            views.append(fitz.IRect(int(vx0 - ox) - 2, int(vy0 - y0) - 2,
-                                    int(vx0 + cw - ox) + 3, int(vy0 + ch - y0) + 3))
-        if len(self._preview_cache) > 40:  # many zoom levels seen
+        if len(self._preview_cache) > 120:  # many zoom levels seen
             self._preview_cache.clear()
-        try:
-            pixmaps = render_preview(self.src, p, self.sheet_index, zpx, self._preview_cache, views)
-        except Exception as e:  # show it in the panel, keep the window alive
-            self._notes(getattr(self, "_notes_lines", []) + [("err", f"Preview failed: {e}")])
-            return
         mg = SHEET_MARGIN_IN * PT * zpx
-        for i, (pix, label) in enumerate(zip(pixmaps, labels)):
-            ox = x0 + i * (w_px + g)
-            self.canvas.create_rectangle(ox + 3, y0 + 3, ox + w_px + 3, y0 + h_px + 3,
-                                         fill="#9a9a9a", outline="")
-            self.canvas.create_rectangle(ox, y0, ox + w_px, y0 + h_px, fill="white", outline="")
-            if pix is not None:
-                img = tk.PhotoImage(data=pix.tobytes("ppm"))  # uncompressed: fastest into Tk
-                self._images.append(img)
-                self.canvas.create_image(ox + pix.x, y0 + pix.y, image=img, anchor="nw")
-            # The 0.1" margin Fiery leaves blank, as a faint dashed line.
-            self.canvas.create_rectangle(ox + mg, y0 + mg, ox + w_px - mg, y0 + h_px - mg,
-                                         outline="#9ab", dash=(3, 3))
-            self.canvas.create_text(ox + w_px / 2, y0 + h_px + 14,
-                                    text=f"Sheet {self.sheet_index + 1} - {label}",
-                                    font=(UI_FONT, 10))
+        seen = []   # sheets on screen: (k, mostly in view)
+        for k in range(count):
+            ux0, uy0 = self._unit_origin(k, lay)
+            on_screen = (ux0 < vx0 + cw and ux0 + uw > vx0 and uy0 < vy0 + ch
+                         and uy0 + uh > vy0)
+            sides = [e for e in p.sides[k] if e is not None]
+            views = []
+            for i in range(len(sides)):
+                ox = ux0 + i * (w_px + g)
+                views.append(fitz.IRect(int(vx0 - ox) - 2, int(vy0 - uy0) - 2,
+                                        int(vx0 + cw - ox) + 3, int(vy0 + ch - uy0) + 3))
+            pixmaps = [None] * len(sides)
+            if on_screen:
+                seen.append((k, uy0 + uh / 2 >= vy0))
+                try:
+                    pixmaps = render_preview(self.src, p, k, zpx, self._preview_cache, views)
+                except Exception as e:  # show it in the panel, keep the window alive
+                    self._notes(getattr(self, "_notes_lines", [])
+                                + [("err", f"Preview failed: {e}")])
+                    return
+            for i, label in enumerate(labels[:len(sides)]):
+                ox = ux0 + i * (w_px + g)
+                self.canvas.create_rectangle(ox + 3, uy0 + 3, ox + w_px + 3, uy0 + h_px + 3,
+                                             fill="#9a9a9a", outline="")
+                self.canvas.create_rectangle(ox, uy0, ox + w_px, uy0 + h_px, fill="white",
+                                             outline="")
+                pix = pixmaps[i]
+                if pix is not None:
+                    img = tk.PhotoImage(data=pix.tobytes("ppm"))  # uncompressed: fastest into Tk
+                    self._images.append(img)
+                    self.canvas.create_image(ox + pix.x, uy0 + pix.y, image=img, anchor="nw")
+                # The 0.1" margin Fiery leaves blank, as a faint dashed line.
+                self.canvas.create_rectangle(ox + mg, uy0 + mg, ox + w_px - mg,
+                                             uy0 + h_px - mg, outline="#9ab", dash=(3, 3))
+                self.canvas.create_text(ox + w_px / 2, uy0 + h_px + 14,
+                                        text=f"Sheet {k + 1} - {label}", font=(UI_FONT, 10))
+        # "Sheet X of N": the first sheet that's mostly in view.
+        if seen:
+            self.sheet_index = next((k for k, mostly in seen if mostly), seen[0][0])
+        self._set_nav(count)
 
     def _set_nav(self, count):
         if count:
