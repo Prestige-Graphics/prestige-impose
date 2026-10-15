@@ -496,3 +496,19 @@ def test_same_both_sides_repeat_multi_page():
     assert p.sheet_count == 2
     out = render(src, p)
     assert [{t for *_, t in words(pg)} for pg in out] == [{"p1"}, {"p1"}, {"p2"}, {"p2"}]
+
+
+def test_scale_to_fit_turns_a_portrait_page_to_fill_a_landscape_sheet():
+    """Leo, 2026-10-08: letter on 12x18 landscape with Scale to fit stayed upright
+    and small. One page per sheet now turns to fill; Turn 90 counts in the fit."""
+    doc = fitz.open()
+    doc.new_page(width=8.5 * PT, height=11 * PT)
+    src = fitz.open("pdf", doc.tobytes())
+    p = plan(src, Settings(layout="normal", orientation="landscape", scaling="fit"))
+    assert p.settings.rotate == 90 and round(p.scale, 3) == 1.388
+    assert any("turned 90" in w for w in p.warnings)
+    same = plan(src, Settings(layout="normal", orientation="portrait", scaling="fit"))
+    assert same.settings.rotate == 0 and round(same.scale, 3) == 1.388
+    # Gangup keeps the turn it's given, but the fit allows for it.
+    g = plan(src, Settings(rows=1, cols=2, orientation="landscape", scaling="fit", rotate=90))
+    assert g.settings.rotate == 90 and round(g.scale, 3) == round(8.9 / 11, 3)

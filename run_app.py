@@ -21,6 +21,10 @@ if not getattr(sys, "frozen", False):
 
 
 def main():
+    # The page-drawing helper process (prestige_impose/renderer.py) starts as a
+    # second copy of the built app; this hands it over to its job.
+    import multiprocessing
+    multiprocessing.freeze_support()
     args = sys.argv[1:]
     if "--selftest" in args:
         from prestige_impose.selftest import run

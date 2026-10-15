@@ -131,6 +131,19 @@ class Settings:
     layout_style: str = "standard"  # standard | head | foot (head to head, foot to foot)
     slot_180: str = "none"          # none | front | back | both: those pieces upside down
     crop_marks: str = "none"        # none | outside | stretch | enlarge (see the top)
+    # Numbered tickets (see numbering.py). Boxes are on the front page:
+    # {"rect": [x0, y0, x1, y1] points, "size": pt, "align": left|center|right,
+    #  "rotate": 0|90|270}.
+    numbering: bool = False
+    num_start: int = 1
+    num_count: int = 100
+    num_zeros: bool = False
+    num_prefix: str = ""
+    num_font: str = "Helvetica"
+    num_colour: tuple = (0.0, 1.0, 1.0, 0.0)   # CMYK red
+    num_boxes: tuple = ()
+    num_order: str = "across"       # across: sheet 1 has 1-10, sheet 2 11-20 | stack: cut and stack
+    num_extras: str = "blank"       # cut and stack spare spots: blank | number (as extras)
     # Presets only: the gutters were "pulled in" when it was saved, so each file
     # gets its own pull-in gutters instead of the saved numbers (cards with
     # different amounts of slug around them need different gutters).
@@ -165,6 +178,10 @@ class Settings:
             d["duplex"] = d["duplex"] != "off"
         if d.get("crop_marks") == "between":  # 1.2.0's "outside + between pieces"
             d["crop_marks"] = "outside"
+        if "num_colour" in d:
+            d["num_colour"] = tuple(float(v) for v in d["num_colour"])
+        if "num_boxes" in d:
+            d["num_boxes"] = tuple(dict(b) for b in d["num_boxes"] or ())
         # 1.2.0's head-to-head turned rows 2, 4, 6..., which is foot to foot.
         if "layout_style" not in d and d.get("head_to_head"):
             d["layout_style"] = "foot"
@@ -179,6 +196,7 @@ class Placement:
     clip: fitz.Rect      # the matching part of the source page
     cut: fitz.Rect       # where this piece is cut, on the sheet
     angle: int = 0       # clockwise turn of the piece on the sheet: 0, 90, 180, 270
+    number: int = None   # numbered tickets: this piece's number
 
 
 @dataclass
@@ -194,6 +212,7 @@ class Plan:
     sides: list                     # [(front, back or None)], each a list of Placement
     finished: tuple = (0.0, 0.0)    # (w, h) points each piece ends up after cutting
     source: object = None           # the document placed (src, or src with bleed made)
+    numbered: tuple = None          # (first, last) ticket number, when numbering
     errors: list = field(default_factory=list)    # stop: output would be wrong
     warnings: list = field(default_factory=list)  # look before printing
 
@@ -361,11 +380,17 @@ def _scan_marks(page):
     edge, longest = 2.0, 0.4 * PT
     # (position along the edge, inner end) of the marks on each edge
     top, bottom, left, right = [], [], [], []
-    for d in page.get_drawings():
+    # The faster C reader; a mark runs in from the edge, so skip any shape that
+    # doesn't touch the edge strips (most of a heavy page's art).
+    for d in page.get_cdrawings():
+        x0, y0, x1, y1 = d["rect"]
+        if (x0 > r.x0 + edge and x1 < r.x1 - edge and y0 > r.y0 + edge
+                and y1 < r.y1 - edge):
+            continue
         for it in d.get("items", ()):
             if it[0] != "l":
                 continue
-            a, b = it[1], it[2]
+            a, b = fitz.Point(it[1]), fitz.Point(it[2])
             if abs(a - b) > longest or abs(a - b) < 2:
                 continue
             if abs(a.x - b.x) < 0.3:                    # vertical
@@ -737,6 +762,28 @@ def plan(src, s):
     """Work out the layout for an open fitz.Document. Draws nothing."""
     s = replace(s)
     errors, warnings = [], []
+    numbered = None
+    if s.numbering:   # one numbered front (and back) per ticket, in order
+        from .numbering import MAX_TICKETS
+        s.layout, s.gang, s.back_same = "gangup", "repeat", False
+        if len(src) > 2:
+            warnings.append(f"Numbering uses page 1 as the front and page 2 as the back; "
+                            f"the other {len(src) - 2} page(s) are left out.")
+        if s.duplex and len(src) < 2:
+            warnings.append("Duplex is on but the ticket has no back (page 2), so it's "
+                            "printed one-sided.")
+            s.duplex = False
+        if not s.num_boxes:
+            errors.append("Numbering is on but no number boxes are placed yet. Click "
+                          "Place numbers... and drag a box where the number goes.")
+            s.num_count = 1   # just show the layout until there are numbers to show
+        if not 1 <= s.num_count <= MAX_TICKETS:
+            errors.append(f"How many tickets must be between 1 and {MAX_TICKETS:,}.")
+            s.num_count = max(1, min(s.num_count, MAX_TICKETS))
+        if s.num_start < 0:
+            errors.append("The first number can't be below 0.")
+            s.num_start = 0
+        numbered = (s.num_start, s.num_start + s.num_count - 1)
     if s.layout == "normal":   # one page per sheet
         s.rows = s.cols = 1
         s.gutter_x = s.gutter_y = 0.0
@@ -772,8 +819,19 @@ def plan(src, s):
     gx, gy = s.gutter_x * PT, s.gutter_y * PT
     if s.scaling == "fit":
         aw, ah = usable_area(s)
-        scale = min((aw - (s.cols - 1) * gx) / (s.cols * fw),
-                    (ah - (s.rows - 1) * gy) / (s.rows * fh))
+
+        def fit_scale(turned):   # the biggest the grid can be, pieces turned or not
+            pw, ph = (fh, fw) if turned else (fw, fh)
+            return min((aw - (s.cols - 1) * gx) / (s.cols * pw),
+                       (ah - (s.rows - 1) * gy) / (s.rows * ph))
+
+        scale = fit_scale(s.rotate % 180)
+        # One page per sheet: a portrait page on a landscape sheet (or the other way)
+        # is turned to fill it, like Acrobat's auto-rotate, rather than left small.
+        if s.layout == "normal" and fit_scale(not s.rotate % 180) > scale * 1.001:
+            s.rotate = (s.rotate + 90) % 360
+            scale = fit_scale(s.rotate % 180)
+            warnings.append(f"The page is turned 90° to fill the {s.orientation} sheet.")
         if scale <= 0:
             errors.append("The gutters alone are wider than the sheet.")
             scale = 1.0
@@ -914,8 +972,65 @@ def plan(src, s):
                 out.append(pl)
         return out
 
-    resolved = [(resolve(f), resolve(b, back=same or s.layout != "normal", surface="back"))
-                for f, b in sides]
+    if numbered:
+        # The ticket laid out once, then a sheet per `per` tickets, numbered in
+        # reading order: sheet 1 has the first `per` numbers, and so on.
+        fronts = [_place(src, 0, r, grid, s_eff, scale, safe, angle_for(r, False, "front"))
+                  for r in slots]
+        backs = ([_place(src, 1, mirror(r), mgrid, s_eff, scale, safe,
+                         angle_for(mirror(r), True, "back")) for r in slots]
+                 if s.duplex else None)
+        first, last = numbered
+        count = last - first + 1
+        use = [j for j, f in enumerate(fronts) if f]   # slots that land on the sheet
+        per_n = max(1, len(use))
+        sheets = ceil(count / per_n)
+        resolved = []
+        warnings[:] = [w for w in warnings if not w.startswith("Repeat with")]
+        if s.num_order == "stack":
+            # Cut and stack: slot j of every sheet gets one run, so after the
+            # guillotine each stack is in order and the stacks pile up 1 to N.
+            # Sheet k, slot j: first + j * sheets + k. Spare spots (when the count
+            # doesn't fill the sheets) are at the end of the last stack.
+            if s.num_extras == "number":
+                last = first + sheets * per_n - 1
+                numbered = (first, last)
+                s.num_count = last - first + 1   # leading zeros and box sizes allow for them
+            for k in range(sheets):
+                f, b = [], ([] if backs else None)
+                for i, j in enumerate(use):
+                    n = first + i * sheets + k
+                    if n > last:
+                        continue
+                    f.append(replace(fronts[j], number=n))
+                    if backs and backs[j]:
+                        b.append(backs[j])
+                resolved.append((f, b))
+            spare = sheets * per_n - count
+            if spare and s.num_extras == "number":
+                warnings.append(f"Cut and stack: {spare} extra ticket(s) are numbered "
+                                f"{first + count} to {last} to fill the sheets.")
+            elif spare:
+                warnings.append(f"Cut and stack: {spare} spot(s) are left blank, at the end of "
+                                f"the last stack(s). Adjust how many tickets to fill the sheets.")
+        else:
+            for k in range(sheets):
+                f, b = [], ([] if backs else None)
+                for i, j in enumerate(use):
+                    n = first + k * per_n + i
+                    if n > last:
+                        break
+                    f.append(replace(fronts[j], number=n))
+                    if backs and backs[j]:
+                        b.append(backs[j])
+                resolved.append((f, b))
+            empty = len(resolved) * per_n - count
+            if empty:
+                warnings.append(f"{empty} slot(s) on the last sheet are empty. Adjust how many "
+                                "tickets to fill it.")
+    else:
+        resolved = [(resolve(f), resolve(b, back=same or s.layout != "normal", surface="back"))
+                    for f, b in sides]
 
     # The size each piece really ends up after cutting: its cut line, unless
     # neighbours were pulled in past it (then the spacing decides).
@@ -959,7 +1074,8 @@ def plan(src, s):
 
     return Plan(settings=s, sheet=(sheet_w, sheet_h), finish=(fw, fh), scale=scale,
                 cell=(cw, ch), grid=grid, slots=slots, sides=resolved,
-                finished=finished, source=src, errors=errors, warnings=warnings)
+                finished=finished, source=src, numbered=numbered, errors=errors,
+                warnings=warnings)
 
 
 # -------------------------------------------------------------------- render
@@ -969,6 +1085,8 @@ def render(src, plan_, sheets=None):
     Build the imposed PDF as a new fitz.Document. `sheets` limits it to some
     sheet indexes (the preview only needs one).
     """
+    if plan_.numbered:
+        return _render_numbered(src, plan_, sheets)
     out = fitz.open()
     src = plan_.source or src
     sw, sh = plan_.sheet
@@ -1008,12 +1126,70 @@ def pairs_turn(s):
     return (s.cols if s.rotate % 180 else s.rows) >= 2
 
 
+def _render_numbered(src, plan_, sheets=None):
+    """
+    Numbered tickets: every full sheet is the same layout, so it's drawn once
+    and copied (copies share the artwork), then each copy gets its numbers.
+    A part-filled last sheet is drawn on its own, so its empty slots stay
+    empty. 5,000 tickets take a few seconds and stay well under a megabyte.
+    """
+    from .numbering import _font, number_sheet
+
+    s, font = plan_.settings, _font(plan_.settings)
+
+    def plain(side_pairs):
+        """The sheets with no numbers (render's normal path)."""
+        bare = [([replace(pl, number=None) for pl in f],
+                 None if b is None else list(b)) for f, b in side_pairs]
+        return render(src, replace(plan_, sides=bare, numbered=None))
+
+    full = len(plan_.sides[0][0])
+    out = plain(plan_.sides[:1])   # page 0 the full front, page 1 its back
+    base = out.page_count
+    indexes = range(plan_.sheet_count) if sheets is None else sheets
+    for i in indexes:
+        front, back = plan_.sides[i]
+        if len(front) == full:
+            out.fullcopy_page(0)
+            number_sheet(out[-1], front, s, plan_.scale, font)
+            if back is not None:
+                out.fullcopy_page(1)
+        else:
+            at = out.page_count
+            out.insert_pdf(plain([(front, back)]))
+            number_sheet(out[at], front, s, plan_.scale, font)
+    out.delete_pages(list(range(base)))
+    return out
+
+
+def stacks(plan_):
+    """Cut and stack: the (first, last) number of each stack, slot by slot."""
+    runs = {}
+    for front, _ in plan_.sides:
+        for i, pl in enumerate(front):
+            if pl.number is not None:
+                lo, hi = runs.get(i, (pl.number, pl.number))
+                runs[i] = (min(lo, pl.number), max(hi, pl.number))
+    return [runs[i] for i in sorted(runs)]
+
+
 def describe(plan_, n_pages):
     """One-paragraph summary for the screen and the command line."""
     s = plan_.settings
     fw, fh = (v / PT for v in plan_.finish)
     sw, sh = s.sheet_size()   # as it's called (the press's own size is used to make it)
     mode = "Normal" if s.layout == "normal" else f"Gangup, {s.gang}"
+    if plan_.numbered:
+        a, b = plan_.numbered
+        from .numbering import number_text
+        mode = (f"Numbered tickets {number_text(a, s)} to {number_text(b, s)} "
+                f"({b - a + 1:,} tickets)")
+        if s.num_order == "stack" and plan_.sheet_count:
+            runs = stacks(plan_)
+            shown = ", ".join(f"{x}-{y}" for x, y in runs[:3]) + (
+                f" ... {runs[-1][0]}-{runs[-1][1]}" if len(runs) > 3 else "")
+            mode += f", cut and stack: {len(runs)} stacks ({shown})"
+        n_pages = 2 if s.duplex else 1
     dup = ("duplex, same both sides" if s.duplex and (s.back_same or n_pages == 1)
            else "duplex" if s.duplex else "single-sided")
     turned = []
@@ -1038,7 +1214,26 @@ def describe(plan_, n_pages):
 
 PREVIEW_CACHE_MAX_PX = 8_000_000   # a page bigger than this at preview zoom isn't cached
 
-def render_preview(src, plan_, sheet_index, zoom, cache, views=None):
+def _preview_rendered(src, plan_, sheet_index, zoom, views):
+    """Numbered sheets differ in their numbers, so the preview draws the real
+    sheet (render) and pictures the part on screen."""
+    sw, sh = plan_.sheet
+    full = fitz.IRect(0, 0, round(sw * zoom), round(sh * zoom))
+    sheet_doc = render(src, plan_, sheets=[sheet_index])
+    out = []
+    for i, page in enumerate(sheet_doc):
+        view = full if views is None else fitz.IRect(views[i]) & full
+        if view.is_empty:
+            out.append(None)
+            continue
+        clip = fitz.Rect(view.x0 / zoom, view.y0 / zoom, view.x1 / zoom, view.y1 / zoom)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+        pix.set_origin(view.x0, view.y0)
+        out.append(pix)
+    return out
+
+
+def render_preview(src, plan_, sheet_index, zoom, cache, views=None, raster=None):
     """
     Fast on-screen picture of one sheet (front, and back if duplex), as
     Pixmaps. Same layout as render(), but the saved PDF always comes from
@@ -1050,9 +1245,15 @@ def render_preview(src, plan_, sheet_index, zoom, cache, views=None):
     as None. Each source page is drawn once at this zoom and kept in `cache`
     (a dict the caller owns and clears), unless that would be huge (a flyer
     zoomed right in): then only its visible part is drawn, each time.
+
+    `raster(doc, pno, zoom, angle, clip)` (optional) supplies the page pictures
+    instead (the window's helper process): a Pixmap as page.get_pixmap would
+    give it, or None if it isn't drawn yet (that piece shows light grey).
     """
     src = plan_.source or src
     sw, sh = plan_.sheet
+    if plan_.numbered:
+        return _preview_rendered(src, plan_, sheet_index, zoom, views)
     k = plan_.scale
     zk = zoom * k
     full = fitz.IRect(0, 0, round(sw * zoom), round(sh * zoom))
@@ -1085,21 +1286,30 @@ def render_preview(src, plan_, sheet_index, zoom, cache, views=None):
             bbox = (fitz.Rect(pr) * mz).irect
             off_x, off_y = round(on_sheet.x0 * zoom), round(on_sheet.y0 * zoom)
             if pr.width * zk * pr.height * zk <= PREVIEW_CACHE_MAX_PX:
-                key = (id(src), pl.pno, round(zk, 5), pl.angle)
-                pix = cache.get(key)
-                if pix is None:
-                    pix = page.get_pixmap(matrix=mz, alpha=False)
-                    cache[key] = pix
-                # A cached picture is reused across slots: place it from
-                # scratch each time (its own top-left is the page's top-left).
-                pix.set_origin(off_x, off_y)
+                if raster:
+                    pix = raster(src, pl.pno, zk, pl.angle, None)
+                else:
+                    key = (id(src), pl.pno, round(zk, 5), pl.angle)
+                    pix = cache.get(key)
+                    if pix is None:
+                        pix = page.get_pixmap(matrix=mz, alpha=False)
+                        cache[key] = pix
+                if pix is not None:
+                    # A picture is reused across slots: place it from scratch
+                    # each time (its own top-left is the page's top-left).
+                    pix.set_origin(off_x, off_y)
             else:
                 part = fitz.Rect(target.x0 / zoom, target.y0 / zoom,
                                  target.x1 / zoom, target.y1 / zoom) * ~m
                 part.normalize()
                 part = (part + (-1, -1, 1, 1)) & pr
-                pix = page.get_pixmap(matrix=mz, clip=part, alpha=False)
-                pix.set_origin(off_x + pix.x - bbox.x0, off_y + pix.y - bbox.y0)
+                pix = (raster(src, pl.pno, zk, pl.angle, part) if raster
+                       else page.get_pixmap(matrix=mz, clip=part, alpha=False))
+                if pix is not None:
+                    pix.set_origin(off_x + pix.x - bbox.x0, off_y + pix.y - bbox.y0)
+            if pix is None:
+                sheet.set_rect(target, (232, 232, 232))   # still being drawn
+                continue
             sheet.copy(pix, target)
         # Crop marks: the same lines as the saved PDF, at least a pixel wide.
         w = max(1, round(MARK_WIDTH_PT * zoom))

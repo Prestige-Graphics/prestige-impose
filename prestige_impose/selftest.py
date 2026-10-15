@@ -65,6 +65,25 @@ def _checks():
     assert images(src) == images(out), "image pixels changed during imposition"
     yield "impose 7x3 duplex, image pixels identical"
 
+    # The helper process that draws the preview (a second copy of the app).
+    import time
+    from .renderer import Renderer
+    r = Renderer()
+    try:
+        assert r.ok, "drawing helper didn't start"
+        r.get("selftest", src, 0, 0.5)
+        end = time.time() + 60
+        while r.busy() and time.time() < end:
+            r.poll()
+            time.sleep(0.05)
+        pix, exact = r.get("selftest", src, 0, 0.5)
+        assert exact and pix is not None, "drawing helper didn't draw"
+        assert pix.samples == src[0].get_pixmap(matrix=fitz.Matrix(0.5, 0.5),
+                                                 alpha=False).samples, "helper drew differently"
+    finally:
+        r.stop()
+    yield "drawing helper process"
+
 
 def run(log_path=None):
     lines, ok = [], True

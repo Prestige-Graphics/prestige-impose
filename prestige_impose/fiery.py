@@ -90,6 +90,10 @@ def copies_for(plan_, quantity):
     s = plan_.settings
     if quantity < 1:
         raise ValueError("Quantity must be at least 1.")
+    if plan_.numbered:   # every sheet is different: quantity is sets of the whole run
+        a, b = plan_.numbered
+        return quantity, (f"{quantity} set(s) of {plan_.sheet_count} sheet(s), "
+                          f"tickets {a} to {b}")
     if s.layout == "gangup" and s.gang == "repeat":
         per = max(1, plan_.per_sheet)
         sheets = ceil(quantity / per)

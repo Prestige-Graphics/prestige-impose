@@ -13,12 +13,15 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import pymupdf as fitz
 
-from . import __version__, fiery, mypresets, pages, updater
+from . import __version__, fiery, mypresets, numbering, pages, updater
+from .number_editor import NumberEditor
+from .renderer import Renderer
 from .engine import (BLEED_IN, PT, SHEET_MARGIN_IN, SHEETS, Settings, delete_preset,
                      describe, finish_rect, has_bleed, load_presets, plan, presets_for_file,
                      pull_in_gutters, render, render_preview, save_preset, settings_for_file,
@@ -33,6 +36,8 @@ SCALING = {"Do not scale": "none", "Scale to fit": "fit", "Custom": "custom"}
 LAYOUT_STYLES = {"Standard": "standard", "Head to head": "head", "Foot to foot": "foot"}
 SLOT_180 = {"None": "none", "Front surface": "front", "Back surface": "back",
             "Front and back surface": "both"}
+NUM_ORDER = {"In order across sheets": "across", "Cut and stack": "stack"}
+NUM_EXTRAS = {"Leave blank": "blank", "Number them as extras": "number"}
 CROP_MARKS = {"None": "none", "Outside only": "outside",
               "With bleed (stretch edges)": "stretch", "With bleed (enlarge)": "enlarge"}
 
@@ -86,6 +91,7 @@ class App(_BaseTk):
         self.page_undo = []      # earlier page lists, for Undo
         self.page_clip = []      # copied / cut pages
         self._thumbs = {}        # token -> PhotoImage
+        self.num_format = Settings()   # numbering format and boxes, from the number editor
         self.extras = {}         # key -> bytes of PDFs inserted ("Insert pages from PDF")
         self.extra_docs = {}     # key -> fitz.Document of those
         self._page_drag = None   # drag-to-move in progress
@@ -96,6 +102,8 @@ class App(_BaseTk):
         self._after = None
         self._images = []        # keep PhotoImages alive
         self._preview_cache = {}  # source pages drawn at preview size
+        self.renderer = Renderer()   # draws pages in a helper process: heavy files don't freeze
+        self._thumb_keep = []        # thumbnails shown while the sharp ones are drawn
         self.zoom_factor = 1.0    # 1.0 = fit the window; bigger = zoomed in
         self._layout = None       # where the sheets sit on the canvas, for zoom/pan
         self._draw_after = None
@@ -328,6 +336,11 @@ class App(_BaseTk):
             "layout_style": tk.StringVar(value="Standard"),
             "slot_180": tk.StringVar(value="None"),
             "crop_marks": tk.StringVar(value="None"),
+            "numbering": tk.BooleanVar(value=False),
+            "num_start": tk.StringVar(value="1"),
+            "num_count": tk.StringVar(value="100"),
+            "num_order": tk.StringVar(value="In order across sheets"),
+            "num_extras": tk.StringVar(value="Leave blank"),
         }
 
         ttk.Label(p, text="Preset", style="Head.TLabel").pack(anchor="w")
@@ -372,6 +385,30 @@ class App(_BaseTk):
 
         self._row(p, "Duplex:", self._combo(v["duplex"], DUPLEX))
         self._row(p, "Crop marks:", self._combo(v["crop_marks"], CROP_MARKS))
+
+        # Numbered tickets: on/off and the run here; the boxes and format in the editor.
+        nr = ttk.Frame(p)
+        nr.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(nr, text="Number the tickets", variable=v["numbering"],
+                        command=self._numbering_ticked).pack(side="left")
+        self.num_btn = ttk.Button(nr, text="Place numbers...", command=self.open_number_editor)
+        self.num_btn.pack(side="right")
+        self.num_row = ttk.Frame(p)
+        ttk.Label(self.num_row, text="First number:", width=15).pack(side="left")
+        ttk.Spinbox(self.num_row, from_=0, to=999999, textvariable=v["num_start"],
+                    width=8).pack(side="left")
+        ttk.Label(self.num_row, text="  How many:").pack(side="left")
+        ttk.Spinbox(self.num_row, from_=1, to=numbering.MAX_TICKETS, textvariable=v["num_count"],
+                    width=8).pack(side="left")
+        self.order_row = ttk.Frame(p)
+        ttk.Label(self.order_row, text="Order:", width=15).pack(side="left")
+        self._combo(v["num_order"], NUM_ORDER)(self.order_row).pack(side="left")
+        self.extras_row = ttk.Frame(p)
+        ttk.Label(self.extras_row, text="Spare spots:", width=15).pack(side="left")
+        self._combo(v["num_extras"], NUM_EXTRAS)(self.extras_row).pack(side="left")
+        self.num_note = ttk.Label(p, text="", style="Small.TLabel", foreground="#555")
+        self.num_anchor = ttk.Frame(p)
+        self.num_anchor.pack(fill="x")
 
         ttk.Separator(p).pack(fill="x", pady=8)
         ttk.Label(p, text="Layout", style="Head.TLabel").pack(anchor="w")
@@ -474,17 +511,56 @@ class App(_BaseTk):
             layout_style=LAYOUT_STYLES[v["layout_style"].get()],
             slot_180=SLOT_180[v["slot_180"].get()],
             crop_marks=CROP_MARKS[v["crop_marks"].get()],
+            numbering=v["numbering"].get(),
+            num_start=num("num_start", "First number", int),
+            num_count=num("num_count", "How many", int),
+            num_zeros=self.num_format.num_zeros,
+            num_prefix=self.num_format.num_prefix,
+            num_font=self.num_format.num_font,
+            num_colour=self.num_format.num_colour,
+            num_boxes=self.num_format.num_boxes,
+            num_order=NUM_ORDER[v["num_order"].get()],
+            num_extras=NUM_EXTRAS[v["num_extras"].get()],
         )
 
     def _sync_widgets(self):
         v = self.vars
+        numbered = v["numbering"].get()
+        if numbered and v["layout"].get() != "Gangup":
+            v["layout"].set("Gangup")     # numbered tickets are always ganged up
         gangup = v["layout"].get() == "Gangup"
-        if gangup and not self.gang_row.winfo_ismapped():
-            self.gang_row.pack(fill="x", pady=3, after=self.layout_row)
+        if gangup and not self.gang_box.winfo_ismapped():
             self.gang_box.pack(fill="x", after=self.slot180_row)
         elif not gangup:
-            self.gang_row.pack_forget()
             self.gang_box.pack_forget()
+        # Gangup type doesn't apply to numbered tickets (every slot is the next ticket).
+        if gangup and not numbered and not self.gang_row.winfo_ismapped():
+            self.gang_row.pack(fill="x", pady=3, after=self.layout_row)
+        elif not gangup or numbered:
+            self.gang_row.pack_forget()
+        self.num_btn.configure(state="normal" if numbered else "disabled")
+        if numbered:
+            self.num_row.pack(in_=self.num_anchor, fill="x", pady=3)
+            self.num_row.lift(self.num_anchor)
+            self.order_row.pack(in_=self.num_anchor, fill="x", pady=3, after=self.num_row)
+            self.order_row.lift(self.num_anchor)
+            if v["num_order"].get() == "Cut and stack":
+                self.extras_row.pack(in_=self.num_anchor, fill="x", pady=3, after=self.order_row)
+                self.extras_row.lift(self.num_anchor)
+            else:
+                self.extras_row.pack_forget()
+            f = self.num_format
+            boxes = len(f.num_boxes)
+            self.num_note.configure(
+                text=(f"{boxes} number box{'es' if boxes != 1 else ''}, "
+                      f"{f.num_font}" + (f', "{f.num_prefix}" before' if f.num_prefix else "")
+                      + (", leading zeros" if f.num_zeros else ""))
+                if boxes else "No number boxes yet: click Place numbers...")
+            self.num_note.pack(in_=self.num_anchor, anchor="w")
+            self.num_note.lift(self.num_anchor)
+        else:
+            for w in (self.num_row, self.order_row, self.extras_row, self.num_note):
+                w.pack_forget()
         self.pct_box.configure(state="normal" if v["scaling"].get() == "Custom" else "disabled")
         if v["sheet"].get() == CUSTOM:
             self.custom_row.pack(in_=self.custom_anchor, fill="x", pady=3)
@@ -545,6 +621,39 @@ class App(_BaseTk):
                                else "none"))
         v["crop_marks"].set(pick(CROP_MARKS, s.crop_marks if s.crop_marks in CROP_MARKS.values()
                                  else "none"))
+        self.num_format = replace(s)
+        v["num_start"].set(str(s.num_start))
+        v["num_count"].set(str(s.num_count))
+        v["num_order"].set(pick(NUM_ORDER, s.num_order if s.num_order in NUM_ORDER.values()
+                                else "across"))
+        v["num_extras"].set(pick(NUM_EXTRAS, s.num_extras if s.num_extras in NUM_EXTRAS.values()
+                                 else "blank"))
+        v["numbering"].set(bool(s.numbering))
+
+    def _numbering_ticked(self):
+        """First time on for this file: go straight to placing the numbers."""
+        if self.vars["numbering"].get() and self.src and not self.num_format.num_boxes:
+            self.after(150, self.open_number_editor)
+
+    def open_number_editor(self):
+        """Place the number boxes on the front of the ticket, set the format."""
+        if not self.src:
+            return
+        try:
+            s = self.settings()
+        except ValueError as e:
+            messagebox.showerror("Check the settings", str(e), parent=self)
+            return
+
+        def done(new):
+            self.num_format = replace(new)
+            self.vars["num_start"].set(str(new.num_start))
+            self.vars["num_count"].set(str(new.num_count))
+            self._schedule()
+
+        win = NumberEditor(self, self.src, s, done)
+        self._centre(win)
+        win.grab_set()
 
     def save_preset(self):
         try:
@@ -932,14 +1041,26 @@ class App(_BaseTk):
         if img is None and token[0] != "blank":
             page = pages.page_of(token, self.original, self.extra_docs)
             z = w / page.rect.width
-            pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
-            img = tk.PhotoImage(data=pix.tobytes("ppm"))
+            if self.renderer.ok:   # drawn by the helper; blank (or stretched) until then
+                pix, exact = self.renderer.get("pages", page.parent, page.number, z)
+                if pix is None:
+                    return None
+                img = tk.PhotoImage(data=pix.tobytes("ppm"))
+                if not exact:
+                    self._thumb_keep.append(img)
+                    return img
+            else:
+                pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+                img = tk.PhotoImage(data=pix.tobytes("ppm"))
             self._thumbs[key] = img
         return img
 
     def _draw_pages(self):
         c = self.pages_canvas
         c.delete("all")
+        self._thumb_keep = []
+        if self.renderer.ok:
+            self.renderer.new_round("pages")
         if not self.src:
             self.pages_label.configure(text="Pages")
             return
@@ -1111,6 +1232,10 @@ class App(_BaseTk):
                 parent=parent or self):
             return None
         part = dest.with_name(dest.name + ".part")
+        busy = [w for w in (self, parent) if w is not None]
+        for w in busy:   # a big file takes a moment: show it's working
+            w.configure(cursor="watch")
+        self.update_idletasks()
         try:
             doc = render(self.src, self.plan)
             doc.save(part, garbage=4, deflate=True)
@@ -1120,6 +1245,10 @@ class App(_BaseTk):
             part.unlink(missing_ok=True)
             messagebox.showerror("Save failed", f"{name}\n\n{e}", parent=parent or self)
             return None
+        finally:
+            for w in busy:
+                if w.winfo_exists():
+                    w.configure(cursor="")
         return dest
 
     # ---------------------------------------------------------- send to Fiery
@@ -1144,11 +1273,11 @@ class App(_BaseTk):
         press_var = tk.StringVar(value=presses[0].name)
         paper_var = tk.StringVar(value=papers[0].name)
         name_var = tk.StringVar(value=self.src_path.stem)
-        qty_var = tk.StringVar(value=str(plan_.per_sheet if plan_.settings.gang == "repeat"
-                                         and plan_.settings.layout == "gangup" else 1))
+        repeat = (plan_.settings.layout == "gangup" and plan_.settings.gang == "repeat"
+                  and not plan_.numbered)
+        qty_var = tk.StringVar(value=str(plan_.per_sheet if repeat else 1))
         tray_var = tk.StringVar(value="Auto")
         colour_var = tk.StringVar(value="Colour")
-        repeat = plan_.settings.layout == "gangup" and plan_.settings.gang == "repeat"
 
         def row(r, label, widget):
             ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 10))
@@ -1337,7 +1466,17 @@ class App(_BaseTk):
                 fn()
             except tk.TclError:   # its window was closed meanwhile
                 pass
-        self.after(80, self._poll_ui)
+        if self.renderer.ok:
+            got = self.renderer.poll()
+            if "preview" in got:
+                self._schedule_draw(20)
+            if "pages" in got:
+                self._draw_pages()
+        self.after(40 if self.renderer.ok and self.renderer.busy() else 80, self._poll_ui)
+
+    def destroy(self):
+        self.renderer.stop()
+        super().destroy()
 
     def _centre(self, win):
         """Put a dialog in the middle of the app window (not the screen corner)."""
@@ -1348,6 +1487,8 @@ class App(_BaseTk):
         y = self.winfo_rooty() + (self.winfo_height() - h) // 3
         win.geometry(f"+{max(0, x)}+{max(0, y)}")
         win.deiconify()
+        win.lift()          # never hidden behind the main window (which it blocks)
+        win.focus_force()
 
     def ask_close(self):
         """
@@ -1361,7 +1502,10 @@ class App(_BaseTk):
         if not self.src:
             self.destroy()
             return
-        win = tk.Toplevel(self)
+        if getattr(self, "_close_win", None) is not None and self._close_win.winfo_exists():
+            self.destroy()      # asked already and clicked close again: just close
+            return
+        win = self._close_win = tk.Toplevel(self)
         win.title("Close Prestige Impose?")
         win.transient(self)
         win.resizable(False, False)
@@ -1629,6 +1773,11 @@ class App(_BaseTk):
             self.canvas.yview_moveto(max(0.0, (ay - my) / region_h))
 
         vx0, vy0 = self.canvas.canvasx(0), self.canvas.canvasy(0)
+        raster = None
+        if self.renderer.ok and not p.numbered:   # numbered sheets are drawn whole, here
+            self.renderer.new_round("preview")
+            raster = lambda doc, pno, zk, angle, clip: self.renderer.get(  # noqa: E731
+                "preview", doc, pno, zk, angle, clip)[0]
         if len(self._preview_cache) > 120:  # many zoom levels seen
             self._preview_cache.clear()
         mg = SHEET_MARGIN_IN * PT * zpx
@@ -1647,7 +1796,8 @@ class App(_BaseTk):
             if on_screen:
                 seen.append((k, uy0 + uh / 2 >= vy0))
                 try:
-                    pixmaps = render_preview(self.src, p, k, zpx, self._preview_cache, views)
+                    pixmaps = render_preview(self.src, p, k, zpx, self._preview_cache, views,
+                                             raster=raster)
                 except Exception as e:  # show it in the panel, keep the window alive
                     self._notes(getattr(self, "_notes_lines", [])
                                 + [("err", f"Preview failed: {e}")])
@@ -1672,6 +1822,13 @@ class App(_BaseTk):
         if seen:
             self.sheet_index = next((k for k, mostly in seen if mostly), seen[0][0])
         self._set_nav(count)
+        if raster and self.renderer.busy():   # pieces still being drawn sharp
+            t = self.canvas.create_text(vx0 + 14, vy0 + 12, text="Drawing...", anchor="nw",
+                                        font=(UI_FONT, 10), fill="#333")
+            x0, y0, x1, y1 = self.canvas.bbox(t)
+            box = self.canvas.create_rectangle(x0 - 6, y0 - 3, x1 + 6, y1 + 3, fill="white",
+                                               outline="#bbb")
+            self.canvas.tag_lower(box, t)
 
     def _set_nav(self, count):
         if count:
