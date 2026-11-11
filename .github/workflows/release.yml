@@ -75,7 +75,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14          # Apple chip (M1 and later)
+          - runner: macos-15          # Apple chip (M1 and later); GitHub retired macos-14 (2026-11)
             arch: arm64
           - runner: macos-15-intel    # Intel Macs
             arch: x86_64

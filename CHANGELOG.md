@@ -3,7 +3,7 @@
 Each version's notes are what staff see in the app's "Update available"
 window. Write them for the person at the press, in plain words.
 
-## 1.4.0 (2026-11-11)
+## 1.4.1 (2026-11-11)
 
 - **Collate in Send to Fiery.** A new Collate box sends the copies in order: sheets 1 to 25, then 1 to 25 again, and so on. It's ticked when the file has more than one sheet, so a calendar or booklet comes out in page order, and after cutting each pile is already in order. Untick it to get all the copies of sheet 1 together, then all of sheet 2 (handy for business cards with a different name on each sheet). No need to set it in Command WorkStation any more.
 - **Fixed: closing from the taskbar.** Closing Prestige Impose from its taskbar preview while it was minimised made it look frozen, because the "Close Prestige Impose?" box was hidden. The window now comes back up in front with the box showing. Clicking close a second time still closes straight away.
