@@ -114,6 +114,28 @@ def test_send_puts_everything_on_the_job(fake_fiery, monkeypatch):
     assert attrs["print-color-mode"] == "color"
 
 
+def test_collate_on_and_off_are_both_sent(fake_fiery):
+    """The Fiery takes multiple-document-handling on a new job (its
+    job-creation-attributes-supported, Press 1, 2026-11-11), so collate goes as
+    that, on and off, never left to the queue's default."""
+    port, got = fake_fiery
+    press = fiery.Press("Press", "127.0.0.1", port)
+    for collate, value in ((True, b"separate-documents-collated-copies"),
+                           (False, b"separate-documents-uncollated-copies")):
+        fiery.send(press, "ipp/hold", b"%PDF", "Desk calendar", 50, "one-sided",
+                   (12 * 72, 18 * 72), collate=collate)
+        # In the raw bytes: keyword tag, the name, then the value.
+        name = b"multiple-document-handling"
+        wire = (struct.pack(">BH", 0x44, len(name)) + name
+                + struct.pack(">H", len(value)) + value)
+        head, doc = got["body"].split(b"\x03%PDF", 1)
+        assert wire in head
+        attrs, _ = parse_request(got["body"])
+        assert attrs["multiple-document-handling"] == value.decode()
+    assert fiery.build_print_job("ipp://x/ipp/hold", b"", "x", 1, "one-sided",
+                                 (864, 1296), user="u").count(b"collated-copies") == 1
+
+
 def test_auto_tray_sends_no_tray(fake_fiery):
     port, got = fake_fiery
     press = fiery.Press("Press", "127.0.0.1", port)

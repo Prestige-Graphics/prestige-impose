@@ -3,6 +3,15 @@
 Each version's notes are what staff see in the app's "Update available"
 window. Write them for the person at the press, in plain words.
 
+## 1.4.0 (2026-11-11)
+
+- **Collate in Send to Fiery.** A new Collate box sends the copies in order: sheets 1 to 25, then 1 to 25 again, and so on. It's ticked when the file has more than one sheet, so a calendar or booklet comes out in page order, and after cutting each pile is already in order. Untick it to get all the copies of sheet 1 together, then all of sheet 2 (handy for business cards with a different name on each sheet). No need to set it in Command WorkStation any more.
+- **Fixed: closing from the taskbar.** Closing Prestige Impose from its taskbar preview while it was minimised made it look frozen, because the "Close Prestige Impose?" box was hidden. The window now comes back up in front with the box showing. Clicking close a second time still closes straight away.
+- **Cut and stack for tickets that are already numbered.** Open a PDF with one ticket per page (page 1 is ticket 1, page 2 is ticket 2, and so on), choose Gangup type "Unique", then Order: "Cut and stack". With 503 tickets at 10 to a sheet (51 sheets), the first spot on every sheet runs pages 1 to 51, the second 52 to 102, and so on. After the guillotine, pile the stacks and they're in order with no sorting. The summary lists the stacks. When the tickets don't fill the sheets, the spare spots are left blank at the end of the last stack. This works for any file with a different piece on each page, like name badges.
+- **Crop marks between the pieces.** Crop marks now also go in the gaps between pieces, not just around the outside of the sheet, so every corner of every piece has its marks. They sit a little away from each piece, on the part that gets cut off. Pieces that touch (no gap) share one cut, so there's nothing to mark between them.
+- **Crop marks show on dark backgrounds.** Every crop mark now has a thin white edge around it, like Illustrator and InDesign marks, so it stands out over dark bleed. On white paper it looks the same as before.
+- **Crop marks with bleed keep pieces apart.** With crop marks set to Stretch or Enlarge, pieces now always sit at least 0.25" apart, so each one keeps its own bleed and its own crop marks. Before, a gutter of 0 pushed the pieces together and two pieces shared one mark. If you type a smaller gutter, the summary says it was opened up to 0.25".
+
 ## 1.3.0 (2026-10-15)
 
 - **Closing always works.** The "Close Prestige Impose?" box always comes up in front, and clicking the window's X a second time closes straight away. Closing no longer waits for a page still being drawn.

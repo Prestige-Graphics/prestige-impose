@@ -559,8 +559,15 @@ class App(_BaseTk):
             self.num_note.pack(in_=self.num_anchor, anchor="w")
             self.num_note.lift(self.num_anchor)
         else:
-            for w in (self.num_row, self.order_row, self.extras_row, self.num_note):
+            for w in (self.num_row, self.extras_row, self.num_note):
                 w.pack_forget()
+            # Unique (a file already one piece per page, like pre-numbered
+            # tickets) can be cut and stack too; spare spots are always blank.
+            if gangup and v["gang"].get() == "Unique":
+                self.order_row.pack(fill="x", pady=3, after=self.gang_row)
+                self.order_row.lift()
+            else:
+                self.order_row.pack_forget()
         self.pct_box.configure(state="normal" if v["scaling"].get() == "Custom" else "disabled")
         if v["sheet"].get() == CUSTOM:
             self.custom_row.pack(in_=self.custom_anchor, fill="x", pady=3)
@@ -1255,7 +1262,7 @@ class App(_BaseTk):
 
     def send_to_fiery(self):
         """
-        Pick a press, paper, quantity, tray and colour; save the imposed PDF
+        Pick a press, paper, quantity, tray, colour and collate; save the imposed PDF
         next to the original and send it to that press's Held queue. Clicking
         Send is the go-ahead (nothing prints: it waits in Held).
         """
@@ -1278,6 +1285,9 @@ class App(_BaseTk):
         qty_var = tk.StringVar(value=str(plan_.per_sheet if repeat else 1))
         tray_var = tk.StringVar(value="Auto")
         colour_var = tk.StringVar(value="Colour")
+        # Collated: sheets 1 to N, then 1 to N again, so each pile is in order.
+        n = plan_.sheet_count
+        collate_var = tk.BooleanVar(value=n > 1)
 
         def row(r, label, widget):
             ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 10))
@@ -1298,6 +1308,10 @@ class App(_BaseTk):
                                      values=list(fiery.TRAYS)))
         row(6, "Colour:", ttk.Combobox(f, textvariable=colour_var, state="readonly", width=12,
                                        values=list(fiery.COLOURS)))
+        row(7, "Collate:", ttk.Checkbutton(
+            f, variable=collate_var,
+            text=(f"In order: sheets 1 to {n}, then 1 to {n} again" if n > 1
+                  else "Only one sheet, so this makes no difference")))
         status = ttk.Label(f, text="", style="Small.TLabel", wraplength=420)
         status.grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
         btns = ttk.Frame(f)
@@ -1341,7 +1355,10 @@ class App(_BaseTk):
             pdf = dest.read_bytes()
             args = dict(press=pr, queue=paper.queue_for(pr), pdf=pdf, job_name=job,
                         copies=copies, sides=fiery.sides_for(plan_), sheet_pt=plan_.sheet,
-                        tray=fiery.TRAYS[tray_var.get()], colour=fiery.COLOURS[colour_var.get()])
+                        tray=fiery.TRAYS[tray_var.get()], colour=fiery.COLOURS[colour_var.get()],
+                        collate=collate_var.get())
+            if n > 1:
+                label += ", collated" if args["collate"] else ", not collated"
 
             def work():
                 try:
@@ -1478,6 +1495,21 @@ class App(_BaseTk):
         self.renderer.stop()
         super().destroy()
 
+    def _show_for_box(self):
+        """
+        Closed from the taskbar while minimised: Windows hides a box that belongs
+        to a minimised window, and the app would sit waiting on a box nobody can
+        see (looks frozen). Bring the window back up before asking.
+        """
+        if self.state() in ("iconic", "withdrawn"):
+            self.deiconify()
+        # Windows won't let a window jump in front of the app being used, so
+        # pin it on top for a moment (the box belongs to it and comes too).
+        self.attributes("-topmost", True)
+        self.lift()
+        self.update()
+        self.attributes("-topmost", False)
+
     def _centre(self, win):
         """Put a dialog in the middle of the app window (not the screen corner)."""
         win.withdraw()
@@ -1495,6 +1527,8 @@ class App(_BaseTk):
         Closing with a file open asks first, with Send to Fiery as the obvious
         next step (closing out of habit before sending was easy to do).
         """
+        if self._sending or self.src:
+            self._show_for_box()
         if self._sending:
             messagebox.showinfo("Still sending", "A job is still on its way to the Fiery. "
                                 "Close once it's sent (a message says so).", parent=self)

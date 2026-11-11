@@ -35,12 +35,16 @@ Turning pieces
                     down (Fiery's "top finished edge", for top-bound duplex).
 
 Crop marks
-  none / outside    marks around the layout, at every cut line (or none).
+  none / outside    marks around the layout, at every cut line (or none), and
+                    short marks in the gaps between pieces wherever there's
+                    room (they print only on what's cut away).
   stretch / enlarge each piece keeps 0.125" of bleed and gets marks. A page
                     with no bleed has bleed made first, either by mirroring its
                     outer 0.125" outward (stretch: the design isn't touched) or
                     by enlarging the whole page (enlarge: edges get cut off).
-                    Either way it still cuts to its original size.
+                    Either way it still cuts to its original size. Gutters
+                    are at least 0.25" so pieces never share a cut and every
+                    piece gets all its marks.
 
 Cut lines
   The cut line of a piece is the file's TrimBox if it has one. If it doesn't,
@@ -79,6 +83,10 @@ MARK_MIN_GAP_IN = 0.0625  # a mark never starts closer than this to printed art
 MARK_MIN_IN = 0.05       # marks are shortened to fit the sheet margin, but not below this
 MARK_WIDTH_PT = 0.25     # hairline
 MARK_CMYK = (0.0, 0.0, 0.0, 1.0)  # 100% K, not rich black
+# A white line under each mark, like Illustrator and InDesign, so marks still
+# show over dark bleed. Invisible on white paper.
+MARK_HALO_PT = 1.5
+MARK_HALO_CMYK = (0.0, 0.0, 0.0, 0.0)
 BLEED_IN = 0.125         # crop marks "with bleed": each piece keeps this much past its cut
 BLEED_MODES = ("stretch", "enlarge")
 LAYOUT_STYLES = ("standard", "head", "foot")
@@ -653,7 +661,8 @@ def mark_lines(placements, safe):
     MARK_OFFSET_IN out from the outermost cut (past the bleed) and running
     outward, cut short at the sheet margin (`safe`) so they always print. A
     side with less than 0.05" of room gets none. Gutter 0 means neighbours
-    share a cut, so it gets one mark. Returns a list of (Point, Point).
+    share a cut, so it gets one mark. Where pieces have a gap between their
+    cuts, short marks go in the gap too. Returns a list of (Point, Point).
     """
     if not placements:
         return []
@@ -681,6 +690,22 @@ def mark_lines(placements, safe):
             add(fitz.Point(left, y), fitz.Point(max(left - length, safe.x0), y))
         if right < safe.x1:
             add(fitz.Point(right, y), fitz.Point(min(right + length, safe.x1), y))
+
+    # Between pieces: where neighbours have a gap between their cuts, a short
+    # mark in the gap at every cut line, MARK_MIN_GAP_IN clear of each cut so
+    # it only prints on what's cut away.
+    g = MARK_MIN_GAP_IN * PT
+
+    def gaps(cuts, lo, hi):
+        return [(a + g, b - g) for a, b in zip(cuts, cuts[1:])
+                if not any(lo(p) <= a + 0.5 and hi(p) >= b - 0.5 for p in placements)]
+
+    for a, b in gaps(xs, lambda p: p.cut.x0, lambda p: p.cut.x1):
+        for y in ys:
+            add(fitz.Point(a, y), fitz.Point(b, y))
+    for a, b in gaps(ys, lambda p: p.cut.y0, lambda p: p.cut.y1):
+        for x in xs:
+            add(fitz.Point(x, a), fitz.Point(x, b))
     return lines
 
 
@@ -789,8 +814,15 @@ def plan(src, s):
         s.gutter_x = s.gutter_y = 0.0
     made_bleed = s.adds_bleed and not all(has_bleed(p) for p in src)
     src = with_bleed(src, s)
+    bleed_gap = 2 * BLEED_IN
+    opened = False
     if s.adds_bleed:
         s.finish = "trim"   # slots are the cut size; the bleed sits in the gutters
+        # Each piece keeps its own bleed and its own cut, so every crop mark
+        # shows. Closer than that, neighbours would share one cut and one mark.
+        opened = ((s.cols > 1 and s.gutter_x < bleed_gap - 0.001)
+                  or (s.rows > 1 and s.gutter_y < bleed_gap - 0.001))
+        s.gutter_x, s.gutter_y = max(s.gutter_x, bleed_gap), max(s.gutter_y, bleed_gap)
     n_pages = len(src)
     sheet_w, sheet_h = (v * PT for v in s.press_size())
     sheet_rect = fitz.Rect(0, 0, sheet_w, sheet_h)
@@ -895,22 +927,33 @@ def plan(src, s):
             warnings.append(f"Duplex is on but the file has {n_pages} pages (odd), so the "
                             "last sheet has a blank back.")
     elif s.layout == "gangup":  # unique
-        if s.duplex:
-            if n_pages % 2:
-                warnings.append(f"Duplex is on but the file has {n_pages} pages (odd). "
-                                "Pages pair up as front/back, so the last piece has no back.")
-            pieces = ceil(n_pages / 2)
-            for start in range(0, pieces, per):
-                front, back = [], []
-                for j, piece in enumerate(range(start, min(start + per, pieces))):
-                    front.append((slots[j], 2 * piece))
-                    if 2 * piece + 1 < n_pages:
-                        back.append((mirror(slots[j]), 2 * piece + 1))
-                sides.append((front, back))
+        if s.duplex and n_pages % 2:
+            warnings.append(f"Duplex is on but the file has {n_pages} pages (odd). "
+                            "Pages pair up as front/back, so the last piece has no back.")
+        pieces = ceil(n_pages / 2) if s.duplex else n_pages
+        if s.num_order == "stack":
+            # Cut and stack, for files already one piece per page (pre-numbered
+            # tickets): slot j of sheet k gets piece j * sheets + k, so each
+            # stack is in page order and the stacks pile up first to last.
+            # Spare spots are blank, at the end of the last stack(s).
+            sheets = ceil(pieces / per)
+            order = [[(j, j * sheets + k) for j in range(per) if j * sheets + k < pieces]
+                     for k in range(sheets)]
+            spare = sheets * per - pieces
+            if spare:
+                warnings.append(f"Cut and stack: {spare} spot(s) are left blank, at the end "
+                                "of the last stack(s).")
         else:
-            for start in range(0, n_pages, per):
-                sides.append(([(slots[j], p) for j, p in
-                               enumerate(range(start, min(start + per, n_pages)))], None))
+            order = [[(j, piece) for j, piece in enumerate(range(start, min(start + per, pieces)))]
+                     for start in range(0, pieces, per)]
+        for sheet in order:
+            if s.duplex:
+                front = [(slots[j], 2 * piece) for j, piece in sheet]
+                back = [(mirror(slots[j]), 2 * piece + 1) for j, piece in sheet
+                        if 2 * piece + 1 < n_pages]
+                sides.append((front, back))
+            else:
+                sides.append(([(slots[j], piece) for j, piece in sheet], None))
     else:  # normal: document order
         chunk = per * (2 if s.duplex else 1)
         for start in range(0, n_pages, chunk):
@@ -926,7 +969,9 @@ def plan(src, s):
     if s.layout == "gangup" and s.gang == "repeat" and n_pages > (2 if pair else 1):
         warnings.append(f"Repeat with a {n_pages}-page file makes {len(sides)} different "
                         "sheets, one per " + ("front/back pair." if pair else "page."))
-    if s.layout != "gangup" or s.gang != "repeat":
+    unique_stack = (not same and s.layout == "gangup" and s.gang == "unique"
+                    and s.num_order == "stack")
+    if (s.layout != "gangup" or s.gang != "repeat") and not unique_stack:
         filled = sum(len(f) for f, _ in sides)
         empty = len(sides) * per - filled
         if empty:
@@ -1047,11 +1092,10 @@ def plan(src, s):
                    "enlarging the artwork, so a little of its edge is cut off")
             warnings.append(f'This file has no bleed, so {BLEED_IN}" was made by {how}. '
                             "Pieces still cut to the file's size.")
-        need = 2 * BLEED_IN - 0.001
-        if (s.cols > 1 and s.gutter_x < need) or (s.rows > 1 and s.gutter_y < need):
-            warnings.append(f'Crop marks with bleed: gutters under {2 * BLEED_IN}" cut the '
-                            f'bleed short where pieces meet. Fit most sets them to '
-                            f'{2 * BLEED_IN}".')
+        if opened:
+            warnings.append(f'Crop marks with bleed keep pieces at least {bleed_gap}" apart, '
+                            f'so each one keeps its bleed and all its crop marks. Gutters '
+                            f'under {bleed_gap}" were opened up to {bleed_gap}".')
 
     # Bigger than the sheet is allowed (sometimes on purpose); just say so.
     # What has to print is the cuts, crop marks and bleed (see outer_spare);
@@ -1105,7 +1149,12 @@ def render(src, plan_, sheets=None):
                 shape = page.new_shape()
                 for a, b in lines:
                     shape.draw_line(a, b)
+                # White underneath first, square ends so the tips are covered too.
                 # closePath=False: a trailing 'h' would double-stroke the last mark.
+                shape.finish(color=MARK_HALO_CMYK, width=MARK_HALO_PT, lineCap=2,
+                             closePath=False)
+                for a, b in lines:
+                    shape.draw_line(a, b)
                 shape.finish(color=MARK_CMYK, width=MARK_WIDTH_PT, closePath=False)
                 shape.commit()
             if entries:
@@ -1162,15 +1211,22 @@ def _render_numbered(src, plan_, sheets=None):
     return out
 
 
-def stacks(plan_):
-    """Cut and stack: the (first, last) number of each stack, slot by slot."""
+def stacks(plan_, pages=False):
+    """Cut and stack: the (first, last) number of each stack, slot by slot.
+    pages: the page numbers instead (a file already one piece per page)."""
     runs = {}
     for front, _ in plan_.sides:
         for i, pl in enumerate(front):
-            if pl.number is not None:
-                lo, hi = runs.get(i, (pl.number, pl.number))
-                runs[i] = (min(lo, pl.number), max(hi, pl.number))
+            n = pl.pno + 1 if pages else pl.number
+            if n is not None:
+                lo, hi = runs.get(i, (n, n))
+                runs[i] = (min(lo, n), max(hi, n))
     return [runs[i] for i in sorted(runs)]
+
+
+def _stacks_text(runs):
+    return f"{len(runs)} stacks (" + ", ".join(f"{x}-{y}" for x, y in runs[:3]) + (
+        f" ... {runs[-1][0]}-{runs[-1][1]}" if len(runs) > 3 else "") + ")"
 
 
 def describe(plan_, n_pages):
@@ -1185,11 +1241,11 @@ def describe(plan_, n_pages):
         mode = (f"Numbered tickets {number_text(a, s)} to {number_text(b, s)} "
                 f"({b - a + 1:,} tickets)")
         if s.num_order == "stack" and plan_.sheet_count:
-            runs = stacks(plan_)
-            shown = ", ".join(f"{x}-{y}" for x, y in runs[:3]) + (
-                f" ... {runs[-1][0]}-{runs[-1][1]}" if len(runs) > 3 else "")
-            mode += f", cut and stack: {len(runs)} stacks ({shown})"
+            mode += ", cut and stack: " + _stacks_text(stacks(plan_))
         n_pages = 2 if s.duplex else 1
+    elif (s.layout == "gangup" and s.gang == "unique" and s.num_order == "stack"
+          and plan_.sheet_count and not (s.duplex and (s.back_same or n_pages == 1))):
+        mode += ", cut and stack: " + _stacks_text(stacks(plan_, pages=True)) + " by page"
     dup = ("duplex, same both sides" if s.duplex and (s.back_same or n_pages == 1)
            else "duplex" if s.duplex else "single-sided")
     turned = []
@@ -1312,18 +1368,23 @@ def render_preview(src, plan_, sheet_index, zoom, cache, views=None, raster=None
                 continue
             sheet.copy(pix, target)
         # Crop marks: the same lines as the saved PDF, at least a pixel wide.
+        # White underneath, at least a pixel each side, as in the saved PDF.
         w = max(1, round(MARK_WIDTH_PT * zoom))
-        for a, b in sheet_marks(plan_, entries):
-            x0, y0 = min(a.x, b.x) * zoom, min(a.y, b.y) * zoom
-            x1, y1 = max(a.x, b.x) * zoom, max(a.y, b.y) * zoom
-            if x1 - x0 < y1 - y0:   # vertical
-                x0 = round(x0 - w / 2)
-                box = fitz.IRect(x0, round(y0), x0 + w, round(y1))
-            else:
-                y0 = round(y0 - w / 2)
-                box = fitz.IRect(round(x0), y0, round(x1), y0 + w)
-            box &= view
-            if not box.is_empty:
-                sheet.set_rect(box, (0, 0, 0))
+        halo = max(w + 2, round(MARK_HALO_PT * zoom))
+        marks = sheet_marks(plan_, entries)
+        for width, extend, colour in ((halo, (halo - w) / 2, (255, 255, 255)),
+                                      (w, 0, (0, 0, 0))):
+            for a, b in marks:
+                x0, y0 = min(a.x, b.x) * zoom, min(a.y, b.y) * zoom
+                x1, y1 = max(a.x, b.x) * zoom, max(a.y, b.y) * zoom
+                if x1 - x0 < y1 - y0:   # vertical
+                    x0 = round(x0 - width / 2)
+                    box = fitz.IRect(x0, round(y0 - extend), x0 + width, round(y1 + extend))
+                else:
+                    y0 = round(y0 - width / 2)
+                    box = fitz.IRect(round(x0 - extend), y0, round(x1 + extend), y0 + width)
+                box &= view
+                if not box.is_empty:
+                    sheet.set_rect(box, colour)
         out.append(sheet)
     return out

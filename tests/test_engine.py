@@ -59,6 +59,38 @@ def test_unique_duplex_back_sits_behind_front():
     assert p2[0] > out[1].rect.width / 2     # mirrored to the right half
 
 
+def test_unique_cut_and_stack_pre_numbered_file():
+    """A file already one ticket per page: slot 1 of every sheet is pages 1-51,
+    slot 2 is 52-102 and so on; the 7 spare spots are blank at the end."""
+    src = make_pdf(503)
+    s = Settings(layout="gangup", gang="unique", num_order="stack",
+                 sheet_w=8.5, sheet_h=11, rows=5, cols=2)
+    p = plan(src, s)
+    assert p.sheet_count == 51 and not p.errors
+    assert [pl.pno + 1 for pl in p.sides[0][0]] == [1, 52, 103, 154, 205, 256, 307, 358, 409, 460]
+    assert [pl.pno + 1 for pl in p.sides[50][0]] == [51, 102, 153, 204, 255, 306, 357, 408, 459]
+    assert sorted(pl.pno for f, _ in p.sides for pl in f) == list(range(503))
+    assert any("7 spot(s) are left blank" in w for w in p.warnings)
+    assert not any("empty" in w for w in p.warnings)
+    assert "cut and stack: 10 stacks (1-51, 52-102, 103-153 ... 460-503) by page" in describe(p, 503)
+    out = render(src, p)
+    assert {w[2] for w in words(out[0])} == {f"p{n}" for n in range(1, 461, 51)}
+
+
+def test_unique_cut_and_stack_duplex_pairs():
+    src = make_pdf(16)   # 8 pieces, front/back pairs, 2 up -> 4 sheets
+    p = plan(src, Settings(layout="gangup", gang="unique", num_order="stack", duplex=True,
+                           sheet_w=8.5, sheet_h=11, rows=2, cols=1))
+    assert p.sheet_count == 4
+    front, back = p.sides[0]
+    assert [pl.pno + 1 for pl in front] == [1, 9] and [pl.pno + 1 for pl in back] == [2, 10]
+
+
+def test_unique_in_order_unchanged():
+    p = plan(make_pdf(8), Settings(layout="gangup", gang="unique", **LETTER_2x2))
+    assert [[pl.pno for pl in f] for f, _ in p.sides] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
 def test_normal_is_one_page_per_sheet_in_order():
     src = make_pdf(8)
     # Rows, columns and gutters left over from a gangup layout don't apply.
@@ -390,9 +422,44 @@ def test_bleed_made_for_a_file_without_any(mode):
         assert x < 19
 
 
-def test_crop_marks_with_bleed_warns_on_tight_gutters():
-    tight = plan(make_pdf(1, bleed_in=0.25), Settings(rows=2, cols=2, crop_marks="stretch"))
-    assert any("cut the bleed short" in w for w in tight.warnings)
+@pytest.mark.parametrize("mode", ["stretch", "enlarge"])
+def test_crop_marks_with_bleed_never_share_a_cut(mode):
+    # Leo: with gutter 0 the pieces shared a cut and a crop mark went missing.
+    src = make_pdf(1)
+    tight = plan(src, Settings(sheet_w=8.5, sheet_h=11, rows=3, cols=2, crop_marks=mode))
+    assert any("opened up" in w for w in tight.warnings)
+    roomy = plan(src, Settings(sheet_w=8.5, sheet_h=11, rows=3, cols=2, gutter_x=0.25,
+                               gutter_y=0.25, crop_marks=mode))
+    assert not any("opened up" in w for w in roomy.warnings)
+    for p in (tight, roomy):
+        pls = p.sides[0][0]
+        xs = engine._merge(v for pl in pls for v in (pl.cut.x0, pl.cut.x1))
+        ys = engine._merge(v for pl in pls for v in (pl.cut.y0, pl.cut.y1))
+        assert (len(xs), len(ys)) == (4, 6)          # every piece has its own cuts
+        lines = engine.sheet_marks(p, pls)
+        # Outside: 4 down, 6 across, both sides. Between: the column gap at all
+        # 6 row cuts, the 2 row gaps at all 4 column cuts.
+        assert len(lines) == 2 * 4 + 2 * 6 + 6 + 2 * 4
+        cuts = [pl.cut for pl in pls]
+        for a, b in lines:   # no mark prints on a piece
+            for pt in (a, b, (a + b) / 2):
+                assert not any((c + (-1, -1, 1, 1)).contains(pt) for c in cuts)
+    # Leo: over dark bleed a mark gets a white edge, as Illustrator does it.
+    a, b = next((a, b) for a, b in engine.sheet_marks(tight, tight.sides[0][0])
+                if a.x == b.x and 4 * PT < a.x < 4.5 * PT and 4 * PT < a.y < 5 * PT)
+    mid = (a + b) / 2
+    gray = lambda pix: pix.pixel(0, 0)[0]                                    # noqa: E731
+    sheet = render(src, tight)[0]
+    near = lambda dx: gray(sheet.get_pixmap(                                 # noqa: E731
+        clip=fitz.Rect(mid.x + dx - 0.1, mid.y - 0.1, mid.x + dx + 0.1, mid.y + 0.1),
+        dpi=720, colorspace=fitz.csGRAY))
+    assert near(0) < 60 and near(0.5) > 200 and near(3) < 100     # black, white, art
+    pix = render_preview(src, tight, 0, 4.0, {})[0]
+    x, y = round(mid.x * 4), round(mid.y * 4)
+    assert pix.pixel(x, y)[:3] == (0, 0, 0) and pix.pixel(x + 2, y)[:3] == (255, 255, 255)
+    # Outside marks with gutter 0 still share the cut, as before.
+    out = plan(src, Settings(sheet_w=8.5, sheet_h=11, rows=3, cols=2, crop_marks="outside"))
+    assert len(engine.sheet_marks(out, out.sides[0][0])) == 2 * 3 + 2 * 4
 
 
 def test_old_crop_mark_choices():
@@ -450,7 +517,9 @@ def test_crop_marks_show_in_preview_and_stay_on_the_sheet():
     src = make_marked_pdf(slug_in=0.4583, art_lines=False)
     p = plan(src, Settings(rows=7, cols=3, gutter_x=-0.63, gutter_y=-0.63, crop_marks="outside"))
     lines = engine.sheet_marks(p, p.sides[0][0])
-    assert len(lines) == 2 * 6 + 2 * 14       # 6 vertical cuts, 14 horizontal
+    # 6 vertical cuts, 14 horizontal, outside; then in the gaps between pieces
+    # (0.29" cut to cut here): 2 column gaps x 14 rows, 6 row gaps x 6 columns.
+    assert len(lines) == 2 * 6 + 2 * 14 + 2 * 14 + 6 * 6
     m = engine.SHEET_MARGIN_IN * PT
     safe = fitz.Rect(m, m, p.sheet[0] - m, p.sheet[1] - m) + (-0.01, -0.01, 0.01, 0.01)
     assert all(safe.contains(a) and safe.contains(b) for a, b in lines)

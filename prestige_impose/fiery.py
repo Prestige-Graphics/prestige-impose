@@ -11,6 +11,12 @@ weight, so that's how they get onto the job.
 
 Tested against two Fiery ES IC-419 servers (Konica C4070), 2026-10-02:
 copies sent here show in Command WorkStation.
+
+Collate: the Fiery lists both multiple-document-handling and sheet-collate as
+supported, but only multiple-document-handling is in its
+job-creation-attributes-supported, so that's the one sent (2026-11-11).
+Proved on Press 1: Command WorkStation shows collated as Collate "Sort" and
+uncollated as "Group". The Fiery's IPP replies show it blank either way.
 """
 
 import getpass
@@ -27,6 +33,9 @@ TRAYS = {"Auto": None, "Tray 1": "tray-1", "Tray 2": "tray-2", "Tray 3": "tray-3
          "Tray 4": "tray-4", "Tray 5": "tray-5"}
 COLOURS = {"Colour": "color", "Grayscale": "monochrome"}
 SET_IN_CWS = "Set in Command WorkStation"
+# Collated copies come out 1, 2, 3, 1, 2, 3; uncollated 1, 1, 2, 2, 3, 3.
+COLLATE = {True: "separate-documents-collated-copies",
+           False: "separate-documents-uncollated-copies"}
 
 # The Fiery's own names for its sheet sizes (from its media-supported list),
 # by size in hundredths of a millimetre, short edge first. Sending the name as
@@ -145,7 +154,7 @@ def _media_col(sheet_pt, tray):
 
 
 def build_print_job(uri, pdf, job_name, copies, sides, sheet_pt, tray=None, colour="color",
-                    user=None, request_id=1):
+                    collate=True, user=None, request_id=1):
     """The bytes of an IPP Print-Job request (operation 0x0002)."""
     head = struct.pack(">BBHI", 1, 1, 0x0002, request_id)
     ops = (b"\x01" + _attr(0x47, "attributes-charset", "utf-8")
@@ -158,6 +167,7 @@ def build_print_job(uri, pdf, job_name, copies, sides, sheet_pt, tray=None, colo
     job = (b"\x02" + _attr(0x21, "copies", int(copies))
            + _attr(0x44, "sides", sides)
            + _attr(0x44, "print-color-mode", colour)
+           + _attr(0x44, "multiple-document-handling", COLLATE[bool(collate)])
            + _media_col(sheet_pt, tray))
     return head + ops + job + b"\x03" + pdf
 
@@ -199,14 +209,14 @@ class SendError(Exception):
 
 
 def send(press, queue, pdf, job_name, copies, sides, sheet_pt, tray=None, colour="color",
-         timeout=120):
+         collate=True, timeout=120):
     """
     Send the PDF bytes to press/queue. Returns the Fiery's job id (or None if
     it didn't say). Raises SendError with a plain-language reason.
     """
     url = f"http://{press.host}:{press.port}/{queue}"
     uri = f"ipp://{press.host}/{queue}"
-    body = build_print_job(uri, pdf, job_name, copies, sides, sheet_pt, tray, colour)
+    body = build_print_job(uri, pdf, job_name, copies, sides, sheet_pt, tray, colour, collate)
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/ipp"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:

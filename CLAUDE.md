@@ -25,6 +25,32 @@ mind. Open questions to settle before building toward a paid product:
 - Code signing (Windows SmartScreen warning, Mac Gatekeeper), licence keys or
   activation, and the Prestige- and Fiery-specific names and defaults.
 
+### The plan (agreed 2026-10-19 to 2026-10-21)
+
+Leo's plan doc: https://claude.ai/code/artifact/1a4b8319-1c42-482d-b8c5-12e34cea3870
+(read it with the Claude Docs tools). In short: all new work goes in a
+separate "Prestige Impose Next" copy (its own branch, folder, Start menu entry
+and settings) plus a CI lock so only `main` can publish. Booklets come first;
+the PyMuPDF licence decision runs alongside; making it work for any shop, then
+selling, come after. Nothing is built yet: waiting on Leo's go-ahead for the
+Next copy.
+
+Additions Leo has decided on (2026-10-21):
+- **Yes:** a check before Send to Fiery (one line: sheet, orientation, sheets,
+  duplex, press, with a warning when something looks off); a "Report a problem"
+  button (useful even if the app stays internal); recent jobs shared across
+  staff (still to choose where they're stored: a OneDrive folder, which is
+  Claude's suggestion for internal use, or an online database such as Supabase
+  if selling comes soon).
+- **Later:** filling boxes from a spreadsheet (badges, cards), building on the
+  number editor.
+- **Unclear:** a printed cutting sheet for the manual guillotine. Leo said
+  "we don't have that, keep it for if we sell", possibly thinking of the Duplo
+  automatic cutters. Confirm with him.
+- **No:** preflight (not useful enough); a sheet-size comparison (the app's
+  "Fit most" was removed on purpose, and this would bring it back).
+- Not yet in the plan doc: the additions above. Add them when Leo confirms.
+
 ## Rules
 
 - **Reads are free. Writes are confirmed.** Releasing, pushing, tagging,
@@ -103,10 +129,9 @@ Publishing a release by hand outside CI is not allowed; always go through the ta
 
 ## Open items (as of 2026-10-15)
 
-- **1.3.0 isn't released or committed yet**: numbered tickets, cut and stack,
-  the helper-process renderer, Scale to fit turn fix, close fixes. Leo tested
-  it and approved shipping on 2026-10-15; Claude Code's safety check blocked
-  the push, so Leo releases it himself or allows the step.
+- **1.3.0 released 2026-10-15** (numbered tickets, cut and stack, helper-process
+  renderer, Scale to fit turn fix, close fixes). Installers and install sheet
+  are in OneDrive; the vault's `company/equipment.md` has it.
 - **Landscape printed portrait.** Leo made a 12x18 landscape sheet with Scale
   to fit and it printed portrait; the file was already landscape, so the 1.3.0
   turn fix may not be the cause. Still need: how he printed it, what the sheet
@@ -118,4 +143,6 @@ Publishing a release by hand outside CI is not allowed; always go through the ta
   backwards.
 - **Box padding.** Leo asked for padding to "start at 13pt, 13pt should be 0";
   implemented as 0 = tight around the number. Confirm that's what he meant.
-- Old test jobs to delete in the Fiery Held queue: 3342-3344, 3310, 3311, 3316.
+- Old test jobs to delete in the Fiery Held queue: 3342-3344, 3310, 3311, 3316,
+  and the collate tests 3884-3886 (2026-11-11). IPP Cancel-Job answers OK but
+  leaves held jobs in Held: delete them in Command WorkStation.
